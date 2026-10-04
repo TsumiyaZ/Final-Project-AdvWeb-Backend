@@ -7,7 +7,11 @@ import { router as jobRoutes } from "./src/routes/jobRoutes";
 
 export const app = express();
 
-app.use(cors());
+app.use(cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'PUT', 'DELETE'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+}));
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -18,3 +22,5 @@ app.use("/api/customer", customerRoutes);
 app.use("/api/order", orderRoutes);
 app.use("/api/route", planningRoutes);
 app.use("/api/jobs", jobRoutes);
+
+export default app;
