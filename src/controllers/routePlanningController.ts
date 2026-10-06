@@ -99,7 +99,7 @@ export const getPendingOrders = async (req: Request, res: Response) => {
              c.latitude, c.longitude
       FROM orders o
       JOIN customers c ON c.id = o.customer_id
-      WHERE o.status = 'pending' AND c.deleted_at IS NULL`;
+      WHERE o.status = 'pending'`;
     const params: unknown[] = [];
     if (date) {
       if (!isValidDateStr(date)) return res.status(400).json({ error: "Invalid date format (YYYY-MM-DD)" });
@@ -165,7 +165,7 @@ export const calculatePlan = async (req: Request, res: Response) => {
              c.latitude, c.longitude
       FROM orders o
       JOIN customers c ON c.id = o.customer_id
-      WHERE o.status = 'pending' AND c.deleted_at IS NULL`;
+      WHERE o.status = 'pending'`;
     const orderParams: unknown[] = [];
     if (deliveryDate) {
       orderSql += ` AND DATE(o.order_date) = ?`;

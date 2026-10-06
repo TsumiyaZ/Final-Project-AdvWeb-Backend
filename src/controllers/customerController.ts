@@ -61,11 +61,7 @@ export const getNearbyCustomers = async (
         }
 
         // ดึงลูกค้าทั้งหมดจากฐานข้อมูล
-        const [rows] = await conn.query(
-            `SELECT *
-             FROM customers
-             WHERE deleted_at IS NULL`
-        );
+        const [rows] = await conn.query('SELECT * FROM customers');
 
         const customers = rows as CustomerModel[];
 
@@ -111,7 +107,10 @@ export const searchNameCustomer = async (req: Request, res: Response) => {
             });
         }
 
-        const [rows] = await conn.query('select * from customers where deleted_at is null and name like ? order by name', [`%${keyword}%`]);
+        const [rows] = await conn.query(
+            'SELECT * FROM customers WHERE name LIKE ? ORDER BY name',
+            [`%${keyword}%`]
+        );
         const cusotmers = rows as CustomerModel[];
 
         return res.status(200).json(cusotmers);

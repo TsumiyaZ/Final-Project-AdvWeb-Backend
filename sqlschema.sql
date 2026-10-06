@@ -36,14 +36,12 @@ CREATE TABLE customers (
     latitude DECIMAL(10, 7) NOT NULL,
     longitude DECIMAL(10, 7) NOT NULL,
     is_demo BOOLEAN NOT NULL DEFAULT FALSE,
-    deleted_at DATETIME(3) NULL,
     created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
         ON UPDATE CURRENT_TIMESTAMP(3),
     PRIMARY KEY (id),
     INDEX idx_customers_name (name),
     INDEX idx_customers_phone (phone),
-    INDEX idx_customers_deleted (deleted_at),
     CONSTRAINT chk_customer_latitude CHECK (latitude BETWEEN -90 AND 90),
     CONSTRAINT chk_customer_longitude CHECK (longitude BETWEEN -180 AND 180)
 ) ENGINE = InnoDB;

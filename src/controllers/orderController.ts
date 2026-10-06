@@ -72,7 +72,6 @@ export const getNearbyOrders = async (req: Request, res: Response) => {
                     c.longitude AS customer_longitude
              FROM orders o
              JOIN customers c ON c.id = o.customer_id
-             WHERE c.deleted_at IS NULL
              ORDER BY o.id`
         );
 
@@ -159,7 +158,10 @@ export const createOrder = async (req: Request, res: Response) => {
             });
         }
 
-        const [customers] = await conn.query('SELECT id FROM customers WHERE id = ? and deleted_at IS NULL', [order.customer_id]);
+        const [customers] = await conn.query(
+            'SELECT id FROM customers WHERE id = ?',
+            [order.customer_id]
+        );
 
         const customerRows = customers as any[];
         
@@ -224,8 +226,7 @@ export const updateOrderByID = async (req: Request,res: Response) => {
         const [customers] = await conn.query(
             `SELECT id
              FROM customers
-             WHERE id = ?
-             AND deleted_at IS NULL`,
+             WHERE id = ?`,
             [updatedOrder.customer_id]
         );
 
@@ -380,11 +381,7 @@ export const randomOrder = async (req: Request,res: Response) => {
             });
         }
 
-        const [rows] = await conn.query(
-            `SELECT id
-             FROM customers
-             WHERE deleted_at IS NULL`
-        );
+        const [rows] = await conn.query('SELECT id FROM customers');
 
         const customers = rows as {id: number}[];
 
