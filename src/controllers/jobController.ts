@@ -7,26 +7,25 @@ export const getJobs = async (req: Request, res: Response) => {
   try {
     const search = String(req.query.search ?? "").trim();
     let sql = `
-      SELECT j.code AS job_code, j.status AS job_status,
+      SELECT rr.job_code,
              DATE_FORMAT(p.delivery_date, '%Y-%m-%d') AS delivery_date,
              p.id AS plan_id,
              rr.id AS route_id, rr.rider_number, rr.rider_id,
-             rr.rider_name, rr.rider_phone, rr.color, rr.color_name,
+             r.name AS rider_name, r.phone AS rider_phone, rr.color,
              rr.total_boxes, rr.distance_km, rr.duration_minutes,
              rr.delivery_cost, rr.navigation_url,
-             COUNT(rs.id) AS total_orders
-      FROM rider_jobs j
-      JOIN rider_routes rr ON rr.id = j.route_id
+             (SELECT COUNT(*) FROM route_stops rs WHERE rs.route_id = rr.id) AS total_orders
+      FROM rider_routes rr
       JOIN delivery_plans p ON p.id = rr.plan_id
-      LEFT JOIN route_stops rs ON rs.route_id = rr.id
+      JOIN riders r ON r.id = rr.rider_id
       WHERE 1=1`;
     const params: unknown[] = [];
     if (search) {
-      sql += ` AND (j.code LIKE ? OR rr.rider_name LIKE ? OR rr.rider_phone LIKE ?)`;
+      sql += ` AND (rr.job_code LIKE ? OR r.name LIKE ? OR r.phone LIKE ?)`;
       const like = `%${search}%`;
       params.push(like, like, like);
     }
-    sql += ` GROUP BY j.code ORDER BY j.issued_at DESC LIMIT 100`;
+    sql += ` ORDER BY rr.id DESC LIMIT 100`;
     const [rows] = await conn.query(sql, params);
     return res.json(rows);
   } catch (err: unknown) {
@@ -40,22 +39,22 @@ export const getJobByCode = async (req: Request, res: Response) => {
   try {
     const code = req.params.code;
     const [rows] = await conn.query(
-      `SELECT j.code AS job_code, j.status AS job_status, j.issued_at,
+      `SELECT rr.job_code,
               DATE_FORMAT(p.delivery_date, '%Y-%m-%d') AS delivery_date,
               p.id AS plan_id, p.departure_time, p.deadline_time,
               p.last_arrival_time, p.all_on_time,
               rr.id AS route_id, rr.rider_number, rr.rider_id,
-              rr.rider_name, rr.rider_phone, rr.color, rr.color_name,
+              r.name AS rider_name, r.phone AS rider_phone, rr.color,
               rr.total_boxes, rr.distance_km, rr.duration_minutes,
               rr.delivery_cost, rr.geometry, rr.navigation_url
-       FROM rider_jobs j
-       JOIN rider_routes rr ON rr.id = j.route_id
+       FROM rider_routes rr
        JOIN delivery_plans p ON p.id = rr.plan_id
-       WHERE j.code = ?`,
+       JOIN riders r ON r.id = rr.rider_id
+       WHERE rr.job_code = ?`,
       [code]
     );
     const list = rows as RowDataPacket[];
-    if (list.length === 0) return res.status(404).json({ error: "Job not found (เช่น JOB001)" });
+    if (list.length === 0) return res.status(404).json({ error: "Job not found" });
     const job = list[0] as Record<string, unknown>;
 
     const [stops] = await conn.query(

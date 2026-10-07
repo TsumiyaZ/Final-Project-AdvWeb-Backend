@@ -5,7 +5,4 @@ export interface CustomerModel {
     address:    string;
     latitude:   string;
     longitude:  string;
-    is_demo:    number;
-    created_at: string;
-    updated_at: string;
 }

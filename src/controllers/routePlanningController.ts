@@ -1,7 +1,6 @@
 import { Request, Response } from "express";
 import { conn } from "../config/dbconnect";
 import { ResultSetHeader, RowDataPacket } from "mysql2";
-import crypto from "crypto";
 import {
   CalculatePlanBody,
   PendingOrderRow,
@@ -79,7 +78,7 @@ export const getShop = async (_req: Request, res: Response) => {
 export const getRiders = async (_req: Request, res: Response) => {
   try {
     const [rows] = await conn.query(
-      "SELECT id, name, phone FROM riders WHERE deleted_at IS NULL ORDER BY id"
+      "SELECT id, name, phone FROM riders ORDER BY id"
     );
     return res.json(rows as RiderModel[]);
   } catch (err: unknown) {
@@ -182,7 +181,7 @@ export const calculatePlan = async (req: Request, res: Response) => {
 
     // 3. ไรเดอร์
     const [riderRows] = await conn.query(
-      "SELECT id, name, phone FROM riders WHERE deleted_at IS NULL ORDER BY id"
+      "SELECT id, name, phone FROM riders ORDER BY id"
     );
     const allRiders = riderRows as RiderModel[];
     if (allRiders.length === 0) return res.status(400).json({ error: "No riders available" });
@@ -252,7 +251,6 @@ export const calculatePlan = async (req: Request, res: Response) => {
     let totalBoxes = 0;
     let totalDist = 0;
     let totalDeliveryCost = 0;
-    let maxDuration = 0;
     let lastArrivalMin = departureMin;
 
     const routeSummaries = plannedRoutes.map((stops, i) => {
@@ -278,7 +276,6 @@ export const calculatePlan = async (req: Request, res: Response) => {
       totalBoxes += boxes;
       totalDist += dist;
       totalDeliveryCost += cost;
-      if (duration > maxDuration) maxDuration = duration;
       if (lastArr > lastArrivalMin) lastArrivalMin = lastArr;
       const color = ROUTE_COLORS[i % ROUTE_COLORS.length]!;
       return { rider, stops, boxes, dist, duration, arrivals, cost, color };
@@ -290,12 +287,6 @@ export const calculatePlan = async (req: Request, res: Response) => {
     const lastArrivalTime = minutesToTimeString(lastArrivalMin);
     const allOnTime = lastArrivalMin <= deadlineMin ? 1 : 0;
 
-    const orderIds = [...orders].map((o) => o.id).sort((a, b) => a - b);
-    const inputSignature = crypto
-      .createHash("sha256")
-      .update(JSON.stringify({ d: effectiveDate, o: orderIds, r: effectiveRiderCount, sp: speedKmh, sv: serviceMinutes }))
-      .digest("hex");
-
     // 6. บันทึกลง DB (transaction)
     const poolConn = await conn.getConnection();
     try {
@@ -303,20 +294,15 @@ export const calculatePlan = async (req: Request, res: Response) => {
 
       const [planResult] = await poolConn.query<ResultSetHeader>(
         `INSERT INTO delivery_plans
-         (delivery_date, input_signature, routing_mode, departure_time, deadline_time,
-          speed_kmh, service_minutes, alternative_index, alternatives_count,
-          shop_snapshot, rider_count, total_orders, total_boxes, distance_km,
+         (delivery_date, departure_time, deadline_time,
+          rider_count, total_orders, total_boxes, distance_km,
           delivery_cost, revenue, food_cost, profit,
-          max_duration_minutes, last_arrival_time, all_on_time, issued_at)
-         VALUES (?, ?, 'road', ?, ?, ?, ?, 0, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(3))`,
+          last_arrival_time, all_on_time)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           effectiveDate,
-          inputSignature,
           departureTime,
           deadlineTime,
-          speedKmh,
-          serviceMinutes,
-          JSON.stringify(shop),
           effectiveRiderCount,
           orders.length,
           totalBoxes,
@@ -325,7 +311,6 @@ export const calculatePlan = async (req: Request, res: Response) => {
           revenue.toFixed(2),
           foodCost.toFixed(2),
           profit.toFixed(2),
-          maxDuration,
           lastArrivalTime,
           allOnTime,
         ]
@@ -336,6 +321,7 @@ export const calculatePlan = async (req: Request, res: Response) => {
       for (let i = 0; i < routeSummaries.length; i++) {
         const rs = routeSummaries[i]!;
         if (rs.stops.length === 0) continue;
+        const jobCode = `JOB${String(planId).padStart(6, "0")}-${String(i + 1).padStart(2, "0")}`;
         const geometry = [
           [shopLat, shopLng],
           ...rs.stops.map((s) => [toNum(s.latitude), toNum(s.longitude)]),
@@ -346,17 +332,15 @@ export const calculatePlan = async (req: Request, res: Response) => {
 
         const [routeResult] = await poolConn.query<ResultSetHeader>(
           `INSERT INTO rider_routes
-           (plan_id, rider_id, rider_number, rider_name, rider_phone, color, color_name,
+           (plan_id, rider_id, rider_number, job_code, color,
             total_boxes, distance_km, duration_minutes, delivery_cost, geometry, navigation_url)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             planId,
             rs.rider.id,
             i + 1,
-            rs.rider.name,
-            rs.rider.phone,
-            rs.color.color,
-            rs.color.name,
+            jobCode,
+            rs.color,
             rs.boxes,
             rs.dist.toFixed(2),
             rs.duration,
@@ -390,20 +374,13 @@ export const calculatePlan = async (req: Request, res: Response) => {
           );
         }
 
-        const jobCode = `JOB${String(routeId).padStart(3, "0")}`;
-        await poolConn.query(
-          `INSERT INTO rider_jobs (code, route_id, status, input_signature) VALUES (?, ?, 'active', ?)`,
-          [jobCode, routeId, inputSignature]
-        );
-
         routesOut.push({
           route_id: routeId,
           rider_id: rs.rider.id,
           rider_number: i + 1,
           rider_name: rs.rider.name,
           rider_phone: rs.rider.phone,
-          color: rs.color.color,
-          color_name: rs.color.name,
+          color: rs.color,
           total_boxes: rs.boxes,
           distance_km: Number(rs.dist.toFixed(2)),
           duration_minutes: rs.duration,
@@ -441,7 +418,6 @@ export const calculatePlan = async (req: Request, res: Response) => {
         revenue: Number(revenue.toFixed(2)),
         food_cost: Number(foodCost.toFixed(2)),
         profit: Number(profit.toFixed(2)),
-        max_duration_minutes: maxDuration,
         last_arrival_time: lastArrivalTime,
         all_on_time: allOnTime === 1,
         shop: {
@@ -471,7 +447,7 @@ export const getPlans = async (_req: Request, res: Response) => {
       `SELECT id, DATE_FORMAT(delivery_date, '%Y-%m-%d') AS delivery_date,
               departure_time, deadline_time, rider_count, total_orders, total_boxes,
               distance_km, delivery_cost, revenue, food_cost, profit,
-              max_duration_minutes, last_arrival_time, all_on_time, created_at
+              last_arrival_time, all_on_time, created_at
        FROM delivery_plans ORDER BY created_at DESC LIMIT 20`
     );
     return res.json(rows);
@@ -487,10 +463,9 @@ export const getPlanById = async (req: Request, res: Response) => {
     const id = req.params.id;
     const [planRows] = await conn.query(
       `SELECT id, DATE_FORMAT(delivery_date, '%Y-%m-%d') AS delivery_date,
-              departure_time, deadline_time, speed_kmh, service_minutes,
+              departure_time, deadline_time,
               rider_count, total_orders, total_boxes, distance_km, delivery_cost,
-              revenue, food_cost, profit, max_duration_minutes, last_arrival_time,
-              all_on_time, shop_snapshot
+              revenue, food_cost, profit, last_arrival_time, all_on_time
        FROM delivery_plans WHERE id = ?`,
       [id]
     );
@@ -498,8 +473,9 @@ export const getPlanById = async (req: Request, res: Response) => {
     if (plans.length === 0) return res.status(404).json({ error: "Plan not found" });
 
     const [routeRows] = await conn.query(
-      `SELECT rr.*, j.code AS job_code
-       FROM rider_routes rr LEFT JOIN rider_jobs j ON j.route_id = rr.id
+      `SELECT rr.*, r.name AS rider_name, r.phone AS rider_phone
+       FROM rider_routes rr
+       JOIN riders r ON r.id = rr.rider_id
        WHERE rr.plan_id = ? ORDER BY rr.rider_number`,
       [id]
     );

@@ -166,28 +166,60 @@ export const createCustomer = async (req: Request, res: Response) => {
 };
 
 export const deleteCustomerByID = async (req: Request, res: Response) => {
+    const connection = await conn.getConnection();
+
     try {
         const id = req.params.id;
-        await conn.query('DELETE FROM orders WHERE customer_id = ?', [id]);
+        await connection.beginTransaction();
 
-        const [result] = await conn.query<ResultSetHeader>('DELETE FROM customers WHERE id = ?', [id]);
+        const [planRows] = await connection.query<any[]>(
+            `SELECT DISTINCT rr.plan_id
+             FROM route_stops rs
+             JOIN orders o ON o.id = rs.order_id
+             JOIN rider_routes rr ON rr.id = rs.route_id
+             WHERE o.customer_id = ?`,
+            [id]
+        );
+
+        const planIds = planRows.map((row) => Number(row.plan_id));
+        if (planIds.length > 0) {
+            const placeholders = planIds.map(() => '?').join(', ');
+            await connection.query(
+                `DELETE FROM delivery_plans WHERE id IN (${placeholders})`,
+                planIds
+            );
+        }
+
+        await connection.query('DELETE FROM orders WHERE customer_id = ?', [id]);
+
+        const [result] = await connection.query<ResultSetHeader>(
+            'DELETE FROM customers WHERE id = ?',
+            [id]
+        );
 
         if (result.affectedRows === 0) {
+            await connection.rollback();
             return res.status(404).json({
                 error: "Customer not found"
             });
         }
 
+        await connection.commit();
+
         return res.status(200).json({
             message: "Deleted customer and related orders successfully",
-            affected_row: result.affectedRows
+            affected_row: result.affectedRows,
+            deleted_related_plans: planIds.length
         });
     } catch (err: any) {
+        await connection.rollback();
         console.error("Error in deleteCustomerByID:", err);
         return res.status(500).json({
             error: 'Database error',
             details: err?.message || String(err)
         });
+    } finally {
+        connection.release();
     }
 };
 

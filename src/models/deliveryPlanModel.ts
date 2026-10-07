@@ -13,7 +13,6 @@ export interface RiderModel {
   id: number;
   name: string;
   phone: string;
-  deleted_at?: string | null;
 }
 
 export interface PendingOrderRow {
@@ -42,8 +41,6 @@ export interface PlanDetail {
   delivery_date: string;
   departure_time: string;
   deadline_time: string;
-  speed_kmh: number;
-  service_minutes: number;
   rider_count: number;
   total_orders: number;
   total_boxes: number;
@@ -52,10 +49,8 @@ export interface PlanDetail {
   revenue: number;
   food_cost: number;
   profit: number;
-  max_duration_minutes: number;
   last_arrival_time: string;
   all_on_time: number | boolean;
-  shop_snapshot?: unknown;
   routes?: RouteDetail[];
 }
 
@@ -67,7 +62,6 @@ export interface RouteDetail {
   rider_name: string;
   rider_phone: string;
   color: string;
-  color_name: string;
   total_boxes: number;
   distance_km: number;
   duration_minutes: number;
@@ -93,15 +87,15 @@ export interface StopDetail {
   distance_from_previous_km: number;
 }
 
-export const ROUTE_COLORS: { color: string; name: string }[] = [
-  { color: '#ef4444', name: 'red' },
-  { color: '#3b82f6', name: 'blue' },
-  { color: '#22c55e', name: 'green' },
-  { color: '#f59e0b', name: 'amber' },
-  { color: '#a855f7', name: 'purple' },
-  { color: '#ec4899', name: 'pink' },
-  { color: '#06b6d4', name: 'cyan' },
-  { color: '#f97316', name: 'orange' },
-  { color: '#84cc16', name: 'lime' },
-  { color: '#6366f1', name: 'indigo' },
+export const ROUTE_COLORS: string[] = [
+  '#ef4444',
+  '#3b82f6',
+  '#22c55e',
+  '#f59e0b',
+  '#a855f7',
+  '#ec4899',
+  '#06b6d4',
+  '#f97316',
+  '#84cc16',
+  '#6366f1',
 ];
