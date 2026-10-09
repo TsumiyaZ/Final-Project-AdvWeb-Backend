@@ -1,6 +1,7 @@
 import express from 'express';
 import { clearDemoOrders, createOrder, deleteOrderByID, getNearbyOrders, getOrder, getOrderByID, randomOrder, updateOrderByID } from '../controllers/orderController';
 
+//โค้ดไฟล์นี้ไม่เกี่ยวกับงาน HW5 Backend นะครับ backend มีเเค่ Customer, order
 export const router = express.Router();
 
 router.get('/', getOrder);

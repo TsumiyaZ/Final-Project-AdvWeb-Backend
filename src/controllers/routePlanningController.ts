@@ -9,6 +9,7 @@ import {
   ShopModel,
 } from "../models/deliveryPlanModel";
 
+//โค้ดไฟล์นี้ไม่เกี่ยวกับงาน HW5 Backend นะครับ backend มีเเค่ Customer, order
 // ---------- helpers ----------
 function toNum(v: string | number | unknown, fallback = 0): number {
   const n = Number(v);

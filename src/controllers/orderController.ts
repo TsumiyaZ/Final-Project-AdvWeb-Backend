@@ -1,6 +1,6 @@
 import { Request, Response } from "express";
 import { conn } from "../config/dbconnect";
-import { ResultSetHeader, RowDataPacket } from "mysql2";
+import { PoolConnection, ResultSetHeader, RowDataPacket } from "mysql2/promise";
 import { CreateOrderModel, OrderModel, UpdateOrderModel } from "../models/orderModel";
 
 interface OrderWithCustomerLocation extends OrderModel {
@@ -10,6 +10,56 @@ interface OrderWithCustomerLocation extends OrderModel {
     customer_latitude: string;
     customer_longitude: string;
 }
+
+const ORDER_STATUSES = new Set(["pending", "delivered", "cancelled"]);
+
+function isValidOrderDate(value: unknown): value is string {
+    if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+        return false;
+    }
+
+    const [year, month, day] = value.split("-").map(Number);
+    const parsedDate = new Date(Date.UTC(year!, month! - 1, day!));
+
+    return parsedDate.getUTCFullYear() === year &&
+        parsedDate.getUTCMonth() === month! - 1 &&
+        parsedDate.getUTCDate() === day;
+}
+
+function formatOrderWithCustomer(order: OrderWithCustomerLocation) {
+    return {
+        id: order.id,
+        customer_id: order.customer_id,
+        quantity: order.quantity,
+        order_date: order.order_date,
+        status: order.status,
+        is_demo: order.is_demo,
+        customer: {
+            id: order.customer_id,
+            name: order.customer_name,
+            phone: order.customer_phone,
+            address: order.customer_address,
+            latitude: order.customer_latitude,
+            longitude: order.customer_longitude
+        }
+    };
+}
+
+const ORDER_WITH_CUSTOMER_QUERY = `
+    SELECT o.id,
+           o.customer_id,
+           o.quantity,
+           DATE_FORMAT(o.order_date, '%Y-%m-%d') AS order_date,
+           o.status,
+           o.is_demo,
+           c.name AS customer_name,
+           c.phone AS customer_phone,
+           c.address AS customer_address,
+           c.latitude AS customer_latitude,
+           c.longitude AS customer_longitude
+    FROM orders o
+    JOIN customers c ON c.id = o.customer_id
+`;
 
 function calculateDistanceKm(
     lat1: number,
@@ -34,12 +84,13 @@ function calculateDistanceKm(
 
 export const getOrder = async (req: Request, res: Response) => {
     try {
-        const [rows] = await conn.query('SELECT * FROM orders');
-        const orders = rows as OrderModel[];
-        res.json(orders);
+        const [rows] = await conn.query(`${ORDER_WITH_CUSTOMER_QUERY} ORDER BY o.id`);
+        const orders = rows as OrderWithCustomerLocation[];
+
+        return res.json(orders.map(formatOrderWithCustomer));
     } catch (err) {
         console.error(err);
-        res.status(500).json({
+        return res.status(500).json({
             error: 'Database error'
         });
     }
@@ -63,17 +114,7 @@ export const getNearbyOrders = async (req: Request, res: Response) => {
             });
         }
 
-        const [rows] = await conn.query(
-            `SELECT o.*,
-                    c.name AS customer_name,
-                    c.phone AS customer_phone,
-                    c.address AS customer_address,
-                    c.latitude AS customer_latitude,
-                    c.longitude AS customer_longitude
-             FROM orders o
-             JOIN customers c ON c.id = o.customer_id
-             ORDER BY o.id`
-        );
+        const [rows] = await conn.query(`${ORDER_WITH_CUSTOMER_QUERY} ORDER BY o.id`);
 
         const orders = rows as OrderWithCustomerLocation[];
 
@@ -87,20 +128,8 @@ export const getNearbyOrders = async (req: Request, res: Response) => {
                 );
 
                 return {
-                    id: order.id,
-                    quantity: order.quantity,
-                    order_date: order.order_date,
-                    status: order.status,
-                    is_demo: order.is_demo,
+                    ...formatOrderWithCustomer(order),
                     distance_km: Number(distance.toFixed(3)),
-                    customer: {
-                        id: order.customer_id,
-                        name: order.customer_name,
-                        phone: order.customer_phone,
-                        address: order.customer_address,
-                        latitude: order.customer_latitude,
-                        longitude: order.customer_longitude
-                    }
                 };
             })
             .filter((order) => order.distance_km <= 2)
@@ -120,23 +149,23 @@ export const getOrderByID = async (req: Request, res: Response) => {
     try {
         const id = req.params.id;
 
-        const [rows] = await conn.query('SELECT * FROM orders WHERE id = ?', [
-            id
-        ]);
+        const [rows] = await conn.query(
+            `${ORDER_WITH_CUSTOMER_QUERY} WHERE o.id = ?`,
+            [id]
+        );
 
-        const orders = rows as OrderModel[];
+        const orders = rows as OrderWithCustomerLocation[];
 
         if (orders.length === 0) {
-            res.status(404).json({
+            return res.status(404).json({
                 error: 'Order not found'
             });
         }
 
-        const order: OrderModel = orders[0]!;
-        res.json(order);
+        return res.json(formatOrderWithCustomer(orders[0]!));
     } catch (err) {
         console.error(err);
-        res.status(500).json({
+        return res.status(500).json({
             error: 'Database error'
         });
     }
@@ -145,22 +174,30 @@ export const getOrderByID = async (req: Request, res: Response) => {
 export const createOrder = async (req: Request, res: Response) => {
     try {
         const order: CreateOrderModel = req.body
+        const customerId = Number(order.customer_id);
+        const quantity = Number(order.quantity);
 
-        if (!order.customer_id || !order.order_date || !order.quantity) {
+        if (!Number.isInteger(customerId) || customerId <= 0 || !order.order_date) {
             return res.status(400).json({
                 error: "Missing required fields"
             });
         }
 
-        if (order.quantity < 1 || order.quantity > 3) {
+        if (!Number.isInteger(quantity) || quantity < 1 || quantity > 3) {
             return res.status(400).json({
-                error: "Quantity must be between 1 and 3"
+                error: "Quantity must be an integer between 1 and 3"
+            });
+        }
+
+        if (!isValidOrderDate(order.order_date)) {
+            return res.status(400).json({
+                error: "Order date must be a valid date in YYYY-MM-DD format"
             });
         }
 
         const [customers] = await conn.query(
             'SELECT id FROM customers WHERE id = ?',
-            [order.customer_id]
+            [customerId]
         );
 
         const customerRows = customers as any[];
@@ -173,20 +210,20 @@ export const createOrder = async (req: Request, res: Response) => {
 
         const [result] = await conn.query<ResultSetHeader>('INSERT INTO orders (customer_id, quantity, order_date) VALUES (?, ?, ?)',
             [
-                order.customer_id,
-                order.quantity,
+                customerId,
+                quantity,
                 order.order_date
             ]
         );
 
-        res.status(201).json({
+        return res.status(201).json({
             affected_rows: result.affectedRows,
             last_id: result.insertId
         });
 
     } catch (err) {
         console.error(err);
-        res.status(500).json({
+        return res.status(500).json({
             error: 'Database error'
         });
     }
@@ -217,9 +254,30 @@ export const updateOrderByID = async (req: Request,res: Response) => {
             ...order
         };
 
-        if (updatedOrder.quantity! < 1 || updatedOrder.quantity! > 3) {
+        const customerId = Number(updatedOrder.customer_id);
+        const quantity = Number(updatedOrder.quantity);
+
+        if (!Number.isInteger(quantity) || quantity < 1 || quantity > 3) {
             return res.status(400).json({
-                error: "Quantity must be between 1 and 3"
+                error: "Quantity must be an integer between 1 and 3"
+            });
+        }
+
+        if (!Number.isInteger(customerId) || customerId <= 0) {
+            return res.status(400).json({
+                error: "Customer ID must be a positive integer"
+            });
+        }
+
+        if (order.order_date !== undefined && !isValidOrderDate(order.order_date)) {
+            return res.status(400).json({
+                error: "Order date must be a valid date in YYYY-MM-DD format"
+            });
+        }
+
+        if (order.status !== undefined && !ORDER_STATUSES.has(order.status)) {
+            return res.status(400).json({
+                error: "Status must be pending, delivered or cancelled"
             });
         }
 
@@ -227,7 +285,7 @@ export const updateOrderByID = async (req: Request,res: Response) => {
             `SELECT id
              FROM customers
              WHERE id = ?`,
-            [updatedOrder.customer_id]
+            [customerId]
         );
 
         const customerRows = customers as { id: number }[];
@@ -246,15 +304,15 @@ export const updateOrderByID = async (req: Request,res: Response) => {
                 status = ?
                 WHERE id = ?`,
             [
-                updatedOrder.customer_id,
-                updatedOrder.quantity,
+                customerId,
+                quantity,
                 updatedOrder.order_date,
                 updatedOrder.status,
                 id
             ]
         );
 
-        res.status(200).json({
+        return res.status(200).json({
             message: "Order updated successfully",
             affected_rows: result.affectedRows
         });
@@ -264,57 +322,74 @@ export const updateOrderByID = async (req: Request,res: Response) => {
     } catch (err) {
         console.error(err);
 
-        res.status(500).json({
+        return res.status(500).json({
             error: "Database error"
         });
     }
 };
 
 export const deleteOrderByID = async (req: Request,res: Response) => {
+    let connection: PoolConnection | undefined;
+
     try {
+        connection = await conn.getConnection();
         const id = req.params.id;
+        await connection.beginTransaction();
 
-        const [result] =
-            await conn.query<ResultSetHeader>(
-                `UPDATE orders
-                 SET status = 'cancelled'
-                 WHERE id = ?
-                 AND status != 'cancelled'`,
-                [id]
-            );
+        const [orderRows] = await connection.query<RowDataPacket[]>(
+            "SELECT id FROM orders WHERE id = ? FOR UPDATE",
+            [id]
+        );
 
-        if (result.affectedRows === 0) {
-
-            const [rows] = await conn.query(
-                `SELECT id, status
-                 FROM orders
-                 WHERE id = ?`,
-                [id]
-            );
-
-            const orders = rows as OrderModel[];
-
-            if (orders.length === 0) {
-                return res.status(404).json({
-                    error: "Order not found"
-                });
-            }
-
-            return res.status(400).json({
-                error: "Order already cancelled"
+        if (orderRows.length === 0) {
+            await connection.rollback();
+            return res.status(404).json({
+                error: "Order not found"
             });
         }
 
-        res.status(200).json({
-            message: "Order cancelled successfully"
+        const [planRows] = await connection.query<RowDataPacket[]>(
+            `SELECT DISTINCT rr.plan_id
+             FROM route_stops rs
+             JOIN rider_routes rr ON rr.id = rs.route_id
+             WHERE rs.order_id = ?`,
+            [id]
+        );
+
+        const planIds = planRows.map((row) => Number(row.plan_id));
+        if (planIds.length > 0) {
+            const placeholders = planIds.map(() => "?").join(", ");
+            await connection.query(
+                `DELETE FROM delivery_plans WHERE id IN (${placeholders})`,
+                planIds
+            );
+        }
+
+        const [result] = await connection.query<ResultSetHeader>(
+            "DELETE FROM orders WHERE id = ?",
+            [id]
+        );
+
+        await connection.commit();
+
+        return res.status(200).json({
+            message: "Order deleted successfully",
+            affected_rows: result.affectedRows,
+            deleted_related_plans: planIds.length
         });
 
-    } catch (err) {
+    } catch (err: any) {
+        if (connection) {
+            await connection.rollback();
+        }
         console.error(err);
 
-        res.status(500).json({
-            error: "Database error"
+        return res.status(500).json({
+            error: "Database error",
+            details: err?.message || String(err)
         });
+    } finally {
+        connection?.release();
     }
 };
 
@@ -372,24 +447,32 @@ export const clearDemoOrders = async (_req: Request, res: Response) => {
 };
 
 export const randomOrder = async (req: Request,res: Response) => {
+    let connection: PoolConnection | undefined;
+
     try {
         const amount = Number(req.body.amount ?? 20);
 
-        if (!Number.isInteger(amount) || amount < 1 || amount > 30) {
+        if (!Number.isInteger(amount) || amount < 20 || amount > 30) {
             return res.status(400).json({
-                error: "Amount must be an integer between 1 and 30"
+                error: "Amount must be an integer between 20 and 30"
             });
         }
 
-        const [rows] = await conn.query('SELECT id FROM customers');
+        connection = await conn.getConnection();
+        await connection.beginTransaction();
+
+        const [rows] = await connection.query('SELECT id FROM customers');
 
         const customers = rows as {id: number}[];
 
         if (customers.length === 0) {
+            await connection.rollback();
             return res.status(400).json({
                 error: "No customers available"
             }); 
         }
+
+        const values: Array<[number, number]> = [];
 
         for (let i = 0; i < amount; i++) {
             const randomCustomer =
@@ -402,27 +485,54 @@ export const randomOrder = async (req: Request,res: Response) => {
             const quantity =
                 Math.floor(Math.random() * 3) + 1;
 
-            await conn.query(
-                `INSERT INTO orders
-                (customer_id, quantity, order_date, status, is_demo)
-                VALUES (?, ?, CURDATE(), 'pending', TRUE)`,
-                [
-                    randomCustomer!.id,
-                    quantity
-                ]
-            );
+            values.push([randomCustomer!.id, quantity]);
         }
 
-        res.status(201).json({
+        const placeholders = values
+            .map(() => "(?, ?, CURDATE(), 'pending', TRUE)")
+            .join(", ");
+        const parameters = values.flatMap(([customerId, quantity]) => [
+            customerId,
+            quantity
+        ]);
+
+        const [insertResult] = await connection.query<ResultSetHeader>(
+            `INSERT INTO orders
+             (customer_id, quantity, order_date, status, is_demo)
+             VALUES ${placeholders}`,
+            parameters
+        );
+
+        const firstId = insertResult.insertId;
+        const lastId = firstId + insertResult.affectedRows - 1;
+        const [createdRows] = await connection.query(
+            `${ORDER_WITH_CUSTOMER_QUERY}
+             WHERE o.id BETWEEN ? AND ?
+             ORDER BY o.id`,
+            [firstId, lastId]
+        );
+
+        await connection.commit();
+
+        const createdOrders = createdRows as OrderWithCustomerLocation[];
+
+        return res.status(201).json({
             message: "Random orders generated",
-            amount
+            amount,
+            orders: createdOrders.map(formatOrderWithCustomer)
         });
 
-    } catch (err) {
+    } catch (err: any) {
+        if (connection) {
+            await connection.rollback();
+        }
         console.error(err);
 
-        res.status(500).json({
-            error: "Database error"
+        return res.status(500).json({
+            error: "Database error",
+            details: err?.message || String(err)
         });
+    } finally {
+        connection?.release();
     }
 };

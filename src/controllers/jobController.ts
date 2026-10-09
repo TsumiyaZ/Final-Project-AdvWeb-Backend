@@ -2,6 +2,7 @@ import { Request, Response } from "express";
 import { conn } from "../config/dbconnect";
 import { RowDataPacket } from "mysql2";
 
+//โค้ดไฟล์นี้ไม่เกี่ยวกับงาน HW5 Backend นะครับ backend มีเเค่ Customer, order
 // GET /api/jobs?search=
 export const getJobs = async (req: Request, res: Response) => {
   try {

@@ -1,7 +1,23 @@
 import { Request, Response } from "express";
 import { conn } from "../config/dbconnect";
 import { CustomerModel } from "../models/customerModel";
-import { ResultSetHeader } from "mysql2";
+import { PoolConnection, ResultSetHeader } from "mysql2/promise";
+
+function isValidCoordinate(
+    latitude: number,
+    longitude: number
+): boolean {
+    return Number.isFinite(latitude) &&
+        latitude >= -90 &&
+        latitude <= 90 &&
+        Number.isFinite(longitude) &&
+        longitude >= -180 &&
+        longitude <= 180;
+}
+
+function isNonEmptyString(value: unknown): value is string {
+    return typeof value === "string" && value.trim().length > 0;
+}
 
 function calculateDistanceKm(
     lat1: number,
@@ -51,10 +67,7 @@ export const getNearbyCustomers = async (
         const latitude = Number(req.query.latitude);
         const longitude = Number(req.query.longitude);
 
-        if (
-            !Number.isFinite(latitude) ||
-            !Number.isFinite(longitude)
-        ) {
+        if (!isValidCoordinate(latitude, longitude)) {
             return res.status(400).json({
                 error: 'Please provide valid latitude and longitude'
             });
@@ -111,9 +124,9 @@ export const searchNameCustomer = async (req: Request, res: Response) => {
             'SELECT * FROM customers WHERE name LIKE ? ORDER BY name',
             [`%${keyword}%`]
         );
-        const cusotmers = rows as CustomerModel[];
+        const customers = rows as CustomerModel[];
 
-        return res.status(200).json(cusotmers);
+        return res.status(200).json(customers);
     } catch (err: any) {
         console.error("Error in getCustomers:", err);
         return res.status(500).json({
@@ -149,8 +162,33 @@ export const createCustomer = async (req: Request, res: Response) => {
     try {
         const { name, phone, address, latitude, longitude } = req.body;
 
+        const parsedLatitude = Number(latitude);
+        const parsedLongitude = Number(longitude);
+
+        if (
+            !isNonEmptyString(name) ||
+            !isNonEmptyString(phone) ||
+            !isNonEmptyString(address)
+        ) {
+            return res.status(400).json({
+                error: "Name, phone and address are required"
+            });
+        }
+
+        if (!isValidCoordinate(parsedLatitude, parsedLongitude)) {
+            return res.status(400).json({
+                error: "Please provide valid latitude and longitude"
+            });
+        }
+
         const sql = 'INSERT INTO customers (name, phone, address, latitude, longitude) VALUES (?, ?, ?, ?, ?)';
-        const [result] = await conn.query<ResultSetHeader>(sql, [name, phone, address, latitude, longitude]);
+        const [result] = await conn.query<ResultSetHeader>(sql, [
+            name.trim(),
+            phone.trim(),
+            address.trim(),
+            parsedLatitude,
+            parsedLongitude
+        ]);
 
         return res.status(201).json({
             affected_rows: result.affectedRows,
@@ -166,9 +204,10 @@ export const createCustomer = async (req: Request, res: Response) => {
 };
 
 export const deleteCustomerByID = async (req: Request, res: Response) => {
-    const connection = await conn.getConnection();
+    let connection: PoolConnection | undefined;
 
     try {
+        connection = await conn.getConnection();
         const id = req.params.id;
         await connection.beginTransaction();
 
@@ -212,14 +251,16 @@ export const deleteCustomerByID = async (req: Request, res: Response) => {
             deleted_related_plans: planIds.length
         });
     } catch (err: any) {
-        await connection.rollback();
+        if (connection) {
+            await connection.rollback();
+        }
         console.error("Error in deleteCustomerByID:", err);
         return res.status(500).json({
             error: 'Database error',
             details: err?.message || String(err)
         });
     } finally {
-        connection.release();
+        connection?.release();
     }
 };
 
@@ -227,6 +268,25 @@ export const updateCustomerByID = async (req: Request, res: Response) => {
     try {
         const id = req.params.id;
         const { name, phone, address, latitude, longitude } = req.body;
+
+        const parsedLatitude = Number(latitude);
+        const parsedLongitude = Number(longitude);
+
+        if (
+            !isNonEmptyString(name) ||
+            !isNonEmptyString(phone) ||
+            !isNonEmptyString(address)
+        ) {
+            return res.status(400).json({
+                error: "Name, phone and address are required"
+            });
+        }
+
+        if (!isValidCoordinate(parsedLatitude, parsedLongitude)) {
+            return res.status(400).json({
+                error: "Please provide valid latitude and longitude"
+            });
+        }
 
         const sql = `
             UPDATE customers
@@ -239,11 +299,11 @@ export const updateCustomerByID = async (req: Request, res: Response) => {
         `;
 
         const [result] = await conn.query<ResultSetHeader>(sql, [
-            name,
-            phone,
-            address,
-            latitude,
-            longitude,
+            name.trim(),
+            phone.trim(),
+            address.trim(),
+            parsedLatitude,
+            parsedLongitude,
             id
         ]);
 

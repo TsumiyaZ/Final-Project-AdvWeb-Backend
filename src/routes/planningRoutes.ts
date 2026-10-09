@@ -8,6 +8,7 @@ import {
   getShop,
 } from "../controllers/routePlanningController";
 
+//โค้ดไฟล์นี้ไม่เกี่ยวกับงาน HW5 Backend นะครับ backend มีเเค่ Customer, order
 export const router = express.Router();
 
 // ต้องวาง /calculate และ path คงที่ก่อน /:id เพื่อกันชนกัน
