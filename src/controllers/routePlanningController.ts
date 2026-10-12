@@ -189,12 +189,26 @@ export const calculatePlan = async (req: Request, res: Response) => {
 
     // กติกา: 1 เส้นทางห้ามเกิน 3 จุด (chk_stop_sequence) -> ต้องมีไรเดอร์อย่างน้อย ceil(orders/3)
     const minRequired = Math.ceil(orders.length / 3);
-    const effectiveRiderCount = Math.max(requestedRiders, minRequired);
-    if (effectiveRiderCount > allRiders.length) {
+    if (requestedRiders < minRequired) {
       return res.status(400).json({
-        error: `Not enough riders (need ${effectiveRiderCount}, have ${allRiders.length})`,
+        error: `rider_count must be at least ${minRequired} for ${orders.length} orders (maximum 3 stops per rider)`,
       });
     }
+
+    if (allRiders.length < minRequired) {
+      return res.status(400).json({
+        error: `Not enough riders (need at least ${minRequired}, have ${allRiders.length})`,
+      });
+    }
+
+    const maxAllowed = Math.min(10, allRiders.length, orders.length);
+    if (requestedRiders > maxAllowed) {
+      return res.status(400).json({
+        error: `rider_count must not exceed ${maxAllowed} for ${orders.length} orders and ${allRiders.length} available riders`,
+      });
+    }
+
+    const effectiveRiderCount = requestedRiders;
     const riders = allRiders.slice(0, effectiveRiderCount);
 
     // 4. แบ่งออเดอร์: เรียงตามมุมจากร้าน แล้วตัดเป็นช่วงๆ แล้วจัดลำดับ nearest-neighbor ในแต่ละช่วง
