@@ -21,7 +21,7 @@ app.use(express.text());
 
 app.use("/api/customer", customerRoutes);
 app.use("/api/order", orderRoutes);
-app.use("/api/route", planningRoutes);
+app.use("/api/plans", planningRoutes);
 app.use("/api/jobs", jobRoutes);
 app.use("/api/dashboard", dashboardRoutes);
 
