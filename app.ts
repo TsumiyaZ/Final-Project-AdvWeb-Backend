@@ -4,6 +4,7 @@ import { router as customerRoutes } from "./src/routes/customerRoutes";
 import { router as orderRoutes } from "./src/routes/orderRoutes";
 import { router as planningRoutes } from "./src/routes/planningRoutes";
 import { router as jobRoutes } from "./src/routes/jobRoutes";
+import { router as dashboardRoutes } from "./src/routes/dashboardRoutes";
 
 export const app = express();
 
@@ -22,5 +23,6 @@ app.use("/api/customer", customerRoutes);
 app.use("/api/order", orderRoutes);
 app.use("/api/route", planningRoutes);
 app.use("/api/jobs", jobRoutes);
+app.use("/api/dashboard", dashboardRoutes);
 
 export default app;
