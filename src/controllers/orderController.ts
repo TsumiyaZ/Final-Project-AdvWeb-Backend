@@ -61,27 +61,6 @@ const ORDER_WITH_CUSTOMER_QUERY = `
     JOIN customers c ON c.id = o.customer_id
 `;
 
-function calculateDistanceKm(
-    lat1: number,
-    lon1: number,
-    lat2: number,
-    lon2: number
-): number {
-    const earthRadiusKm = 6371;
-    const latDistance = (lat2 - lat1) * Math.PI / 180;
-    const lonDistance = (lon2 - lon1) * Math.PI / 180;
-
-    const a =
-        Math.sin(latDistance / 2) * Math.sin(latDistance / 2) +
-        Math.cos(lat1 * Math.PI / 180) *
-        Math.cos(lat2 * Math.PI / 180) *
-        Math.sin(lonDistance / 2) *
-        Math.sin(lonDistance / 2);
-
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    return earthRadiusKm * c;
-}
-
 export const getOrder = async (req: Request, res: Response) => {
     try {
         const [rows] = await conn.query(`${ORDER_WITH_CUSTOMER_QUERY} ORDER BY o.id`);
@@ -102,6 +81,8 @@ export const getNearbyOrders = async (req: Request, res: Response) => {
         const longitude = Number(req.query.longitude);
 
         if (
+            typeof req.query.latitude !== 'string' || !req.query.latitude.trim() ||
+            typeof req.query.longitude !== 'string' || !req.query.longitude.trim() ||
             !Number.isFinite(latitude) ||
             latitude < -90 ||
             latitude > 90 ||
@@ -114,26 +95,24 @@ export const getNearbyOrders = async (req: Request, res: Response) => {
             });
         }
 
-        const [rows] = await conn.query(`${ORDER_WITH_CUSTOMER_QUERY} ORDER BY o.id`);
+        // ใช้ข้อมูลออเดอร์พร้อมลูกค้าจาก query เดิม แล้วให้ SQL กรองระยะไม่เกิน 2 กม.
+        const [rows] = await conn.query(
+            `SELECT order_data.*,
+                    ST_Distance_Sphere(
+                        POINT(IF(customer_longitude = -180, 180, customer_longitude), customer_latitude),
+                        POINT(?, ?)
+                    ) / 1000 AS distance_km
+             FROM (${ORDER_WITH_CUSTOMER_QUERY}) AS order_data
+             HAVING distance_km <= 2
+             ORDER BY distance_km, id`,
+            [longitude === -180 ? 180 : longitude, latitude]
+        );
 
-        const orders = rows as OrderWithCustomerLocation[];
-
-        const nearbyOrders = orders
-            .map((order) => {
-                const distance = calculateDistanceKm(
-                    latitude,
-                    longitude,
-                    Number(order.customer_latitude),
-                    Number(order.customer_longitude)
-                );
-
-                return {
-                    ...formatOrderWithCustomer(order),
-                    distance_km: Number(distance.toFixed(3)),
-                };
-            })
-            .filter((order) => order.distance_km <= 2)
-            .sort((a, b) => a.distance_km - b.distance_km);
+        const orders = rows as (OrderWithCustomerLocation & { distance_km: number })[];
+        const nearbyOrders = orders.map((order) => ({
+            ...formatOrderWithCustomer(order),
+            distance_km: Number(Number(order.distance_km).toFixed(3))
+        }));
 
         return res.status(200).json(nearbyOrders);
     } catch (err: any) {

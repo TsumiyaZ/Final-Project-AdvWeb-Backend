@@ -19,32 +19,6 @@ function isNonEmptyString(value: unknown): value is string {
     return typeof value === "string" && value.trim().length > 0;
 }
 
-function calculateDistanceKm(
-    lat1: number,
-    lon1: number,
-    lat2: number,
-    lon2: number
-): number {
-    const earthRadiusKm = 6371;
-
-    const latDistance = (lat2 - lat1) * Math.PI / 180;
-    const lonDistance = (lon2 - lon1) * Math.PI / 180;
-
-    const a =
-        Math.sin(latDistance / 2) * Math.sin(latDistance / 2) +
-        Math.cos(lat1 * Math.PI / 180) *
-        Math.cos(lat2 * Math.PI / 180) *
-        Math.sin(lonDistance / 2) *
-        Math.sin(lonDistance / 2);
-
-    const c = 2 * Math.atan2(
-        Math.sqrt(a),
-        Math.sqrt(1 - a)
-    );
-
-    return earthRadiusKm * c;
-}
-
 export const getCustomers = async (req: Request, res: Response) => {
     try {
         const [rows] = await conn.query('SELECT * FROM customers');
@@ -67,36 +41,33 @@ export const getNearbyCustomers = async (
         const latitude = Number(req.query.latitude);
         const longitude = Number(req.query.longitude);
 
-        if (!isValidCoordinate(latitude, longitude)) {
+        if (
+            typeof req.query.latitude !== 'string' || !req.query.latitude.trim() ||
+            typeof req.query.longitude !== 'string' || !req.query.longitude.trim() ||
+            !isValidCoordinate(latitude, longitude)
+        ) {
             return res.status(400).json({
                 error: 'Please provide valid latitude and longitude'
             });
         }
 
-        // ดึงลูกค้าทั้งหมดจากฐานข้อมูล
-        const [rows] = await conn.query('SELECT * FROM customers');
+        const [rows] = await conn.query(
+            `SELECT c.*,
+                    ST_Distance_Sphere(
+                        POINT(IF(c.longitude = -180, 180, c.longitude), c.latitude),
+                        POINT(?, ?)
+                    ) / 1000 AS distance_km
+             FROM customers c
+             HAVING distance_km <= 1
+             ORDER BY distance_km, c.id`,
+            [longitude === -180 ? 180 : longitude, latitude]
+        );
 
-        const customers = rows as CustomerModel[];
-
-        // เพิ่มระยะทางให้ลูกค้าแต่ละคน
-        const customersWithDistance = customers.map((customer) => {
-            const distance = calculateDistanceKm(
-                latitude,
-                longitude,
-                Number(customer.latitude),
-                Number(customer.longitude)
-            );
-
-            return {
-                ...customer,
-                distance_km: Number(distance.toFixed(3))
-            };
-        });
-
-        // เลือกเฉพาะคนที่อยู่ไม่เกิน 1 กิโลเมตร
-        const nearbyCustomers = customersWithDistance
-            .filter((customer) => customer.distance_km <= 1)
-            .sort((a, b) => a.distance_km - b.distance_km);
+        const customers = rows as (CustomerModel & { distance_km: number })[];
+        const nearbyCustomers = customers.map((customer) => ({
+            ...customer,
+            distance_km: Number(Number(customer.distance_km).toFixed(3))
+        }));
 
         return res.status(200).json(nearbyCustomers);
 
