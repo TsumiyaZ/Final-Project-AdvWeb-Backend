@@ -25,6 +25,8 @@ export interface PendingOrderModel {
   customer_id: number;
   quantity: number;
   customer_name: string;
+  phone?: string;
+  address?: string;
   latitude: string | number;
   longitude: string | number;
 }

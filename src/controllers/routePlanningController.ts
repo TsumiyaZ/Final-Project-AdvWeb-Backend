@@ -1,5 +1,6 @@
 import { Request, Response } from "express";
 import { conn } from "../config/dbconnect";
+import { ResultSetHeader } from "mysql2";
 import { ShopModel } from "../models/deliveryPlanModel";
 import { RiderModel } from "../models/riderModel";
 import { PendingOrderModel } from "../models/orderModel";
@@ -79,6 +80,13 @@ function isValidDateStr(value: string): boolean {
   return /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(value));
 }
 
+function formatSqlTime(totalMinutes: number): string {
+  const minutesInDay = ((totalMinutes % 1440) + 1440) % 1440;
+  const hours = String(Math.floor(minutesInDay / 60)).padStart(2, "0");
+  const minutes = String(minutesInDay % 60).padStart(2, "0");
+  return `${hours}:${minutes}:00`;
+}
+
 // ---------- GET /api/plans/shop ----------
 export const getShop = async (_req: Request, res: Response) => {
   try {
@@ -152,7 +160,9 @@ export const calculatePlan = async (req: Request, res: Response) => {
 
   try {
     const [shopRows] = await conn.query(
-      'SELECT id, name, latitude, longitude FROM shops WHERE id = 1'
+      `SELECT id, name, latitude, longitude, price_per_box, cost_per_box,
+              rider_base_fee, rider_per_box_km
+       FROM shops WHERE id = 1`
     );
     const shops = shopRows as ShopModel[];
     const shop = shops[0];
@@ -163,7 +173,7 @@ export const calculatePlan = async (req: Request, res: Response) => {
 
     const sql = `
       SELECT o.id, o.customer_id, o.quantity,
-      c.name AS customer_name,
+      c.name AS customer_name, c.phone, c.address,
       c.latitude, c.longitude
       FROM orders o
       JOIN customers c ON c.id = o.customer_id
@@ -175,6 +185,12 @@ export const calculatePlan = async (req: Request, res: Response) => {
     const [ordersQuery] = await conn.query(sql, [deliveryDate]);
 
     const orders = ordersQuery as PendingOrderModel[];
+
+    if (orders.length === 0) {
+      return res.status(400).json({
+        error: 'ไม่มีออเดอร์ pending ในวันที่เลือก'
+      });
+    }
 
     const [ridersQuery] = await conn.query(
       'SELECT id, name, phone FROM riders ORDER BY id'
@@ -312,10 +328,160 @@ export const calculatePlan = async (req: Request, res: Response) => {
       })
     );
 
+    const activeRoutes = routesWithGeometry.filter((route) => route.stops.length > 0);
+    const totalBoxes = activeRoutes.reduce((sum, route) => sum + route.total_boxes, 0);
+    const totalDistanceKm = activeRoutes.reduce((sum, route) => sum + route.distance_km, 0);
+    const pricePerBox = Number(shop.price_per_box);
+    const costPerBox = Number(shop.cost_per_box);
+    const riderBaseFee = Number(shop.rider_base_fee);
+    const riderPerBoxKm = Number(shop.rider_per_box_km);
+    const routeCosts = activeRoutes.map((route) =>
+      riderBaseFee + riderPerBoxKm * route.total_boxes * route.distance_km
+    );
+    const totalDeliveryCost = routeCosts.reduce((sum, cost) => sum + cost, 0);
+    const revenue = totalBoxes * pricePerBox;
+    const foodCost = totalBoxes * costPerBox;
+    const profit = revenue - foodCost - totalDeliveryCost;
+    const longestRouteMinutes = Math.max(...activeRoutes.map((route) => route.travel_minutes));
+    const lastArrivalTime = formatSqlTime(11 * 60 + 30 + longestRouteMinutes);
+    const allOnTime = activeRoutes.every((route) => route.travel_minutes <= 60);
+
+    const connection = await conn.getConnection();
+    let planId = 0;
+    const savedRoutes: Record<string, unknown>[] = [];
+
+    try {
+      await connection.beginTransaction();
+
+      const [planResult] = await connection.query<ResultSetHeader>(
+        `INSERT INTO delivery_plans
+         (delivery_date, departure_time, deadline_time, rider_count, total_orders,
+          total_boxes, distance_km, delivery_cost, revenue, food_cost, profit,
+          last_arrival_time, all_on_time)
+         VALUES (?, '11:30:00', '12:30:00', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          deliveryDate,
+          riderCount,
+          orders.length,
+          totalBoxes,
+          totalDistanceKm.toFixed(2),
+          totalDeliveryCost.toFixed(2),
+          revenue.toFixed(2),
+          foodCost.toFixed(2),
+          profit.toFixed(2),
+          lastArrivalTime,
+          allOnTime
+        ]
+      );
+      planId = planResult.insertId;
+
+      const routeColors = ["#dc2626", "#16a34a", "#2563eb", "#9333ea", "#ea580c", "#0891b2", "#c2410c", "#4f46e5", "#65a30d", "#db2777"];
+      const orderPointIndexes = new Map(orders.map((order, index) => [order.id, index + 1]));
+
+      for (let routeIndex = 0; routeIndex < routesWithGeometry.length; routeIndex++) {
+        const route = routesWithGeometry[routeIndex]!;
+        if (route.stops.length === 0) continue;
+
+        const riderNumber = routeIndex + 1;
+        const jobCode = `JOB${String(planId).padStart(6, "0")}-${String(riderNumber).padStart(2, "0")}`;
+        const color = routeColors[routeIndex % routeColors.length]!;
+        const routeCost = routeCosts[activeRoutes.indexOf(route)]!;
+        const navigationUrl = `https://www.google.com/maps/dir/${[
+          `${shop.latitude},${shop.longitude}`,
+          ...route.stops.map((stop) => `${stop.latitude},${stop.longitude}`)
+        ].join("/")}`;
+
+        const [routeResult] = await connection.query<ResultSetHeader>(
+          `INSERT INTO rider_routes
+           (plan_id, rider_id, rider_number, job_code, color, total_boxes,
+            distance_km, duration_minutes, delivery_cost, geometry, navigation_url)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            planId,
+            route.rider.id,
+            riderNumber,
+            jobCode,
+            color,
+            route.total_boxes,
+            route.distance_km.toFixed(2),
+            route.travel_minutes,
+            routeCost.toFixed(2),
+            JSON.stringify(route.geometry),
+            navigationUrl
+          ]
+        );
+        const routeId = routeResult.insertId;
+
+        let previousPointIndex = 0;
+        let elapsedSeconds = 0;
+        for (const stop of route.stops) {
+          const pointIndex = orderPointIndexes.get(stop.id);
+          if (pointIndex === undefined) {
+            throw new Error(`ไม่พบพิกัดของออเดอร์ ${stop.id}`);
+          }
+
+          const legDistance = distances[previousPointIndex]?.[pointIndex];
+          const legDuration = durations[previousPointIndex]?.[pointIndex];
+          if (legDistance == null || legDuration == null) {
+            throw new Error(`หาเวลา/ระยะทางของออเดอร์ ${stop.id} ไม่พบ`);
+          }
+          elapsedSeconds += legDuration;
+
+          await connection.query(
+            `INSERT INTO route_stops
+             (route_id, order_id, stop_sequence, customer_name, phone, address,
+              latitude, longitude, quantity, arrival_time, distance_from_previous_km)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              routeId,
+              stop.id,
+              stop.stop_sequence,
+              stop.customer_name,
+              stop.phone ?? "",
+              stop.address ?? "",
+              Number(stop.latitude),
+              Number(stop.longitude),
+              stop.quantity,
+              formatSqlTime(11 * 60 + 30 + Math.ceil(elapsedSeconds / 60)),
+              (legDistance / 1000).toFixed(2)
+            ]
+          );
+          previousPointIndex = pointIndex;
+        }
+
+        savedRoutes.push({
+          ...route,
+          plan_id: planId,
+          route_id: routeId,
+          job_code: jobCode,
+          color,
+          delivery_cost: Number(routeCost.toFixed(2)),
+          navigation_url: navigationUrl
+        });
+      }
+
+      await connection.commit();
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
+
     return res.json({
+      plan_id: planId,
       delivery_date: deliveryDate,
       rider_count: riderCount,
-      routes: routesWithGeometry
+      total_orders: orders.length,
+      total_boxes: totalBoxes,
+      distance_km: Number(totalDistanceKm.toFixed(2)),
+      delivery_cost: Number(totalDeliveryCost.toFixed(2)),
+      revenue: Number(revenue.toFixed(2)),
+      food_cost: Number(foodCost.toFixed(2)),
+      profit: Number(profit.toFixed(2)),
+      last_arrival_time: lastArrivalTime,
+      all_on_time: allOnTime,
+      routes: savedRoutes
     });
   } catch (error: unknown) {
     console.error('calculatePlan:', error);
