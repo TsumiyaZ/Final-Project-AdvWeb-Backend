@@ -2,6 +2,12 @@ import { Request, Response } from "express";
 import { conn } from "../config/dbconnect";
 import { RowDataPacket } from "mysql2";
 
+interface JobRecord extends RowDataPacket {
+  route_id: number;
+  geometry: unknown;
+  stops?: RowDataPacket[];
+}
+
 
 // GET /api/jobs?search=
 export const getJobs = async (req: Request, res: Response) => {
@@ -39,7 +45,7 @@ export const getJobs = async (req: Request, res: Response) => {
 export const getJobByCode = async (req: Request, res: Response) => {
   try {
     const code = req.params.code;
-    const [rows] = await conn.query(
+    const [rows] = await conn.query<JobRecord[]>(
       `SELECT rr.job_code,
               DATE_FORMAT(p.delivery_date, '%Y-%m-%d') AS delivery_date,
               p.id AS plan_id, p.departure_time, p.deadline_time,
@@ -54,24 +60,22 @@ export const getJobByCode = async (req: Request, res: Response) => {
        WHERE rr.job_code = ? AND p.is_active = TRUE`,
       [code]
     );
-    const list = rows as RowDataPacket[];
-    if (list.length === 0) return res.status(404).json({ error: "Job not found" });
-    const job = list[0] as Record<string, unknown>;
+    const job = rows[0];
+    if (!job) return res.status(404).json({ error: "Job not found" });
 
-    const [stops] = await conn.query(
+    const [stops] = await conn.query<RowDataPacket[]>(
       `SELECT order_id, stop_sequence, customer_name, phone, address,
               latitude, longitude, quantity, arrival_time, distance_from_previous_km
        FROM route_stops WHERE route_id = ? ORDER BY stop_sequence`,
-      [(job as { route_id: number }).route_id]
+      [job.route_id]
     );
-    (job as Record<string, unknown>).stops = stops;
+    job.stops = stops;
 
-    const g = (job as Record<string, unknown>).geometry;
-    if (typeof g === "string") {
+    if (typeof job.geometry === "string") {
       try {
-        (job as Record<string, unknown>).geometry = JSON.parse(g);
+        job.geometry = JSON.parse(job.geometry);
       } catch {
-        /* keep */
+        // ถ้า JSON ในฐานข้อมูลไม่ถูกต้อง ให้ส่งค่าเดิมกลับไป
       }
     }
     return res.json(job);

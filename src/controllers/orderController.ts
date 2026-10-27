@@ -17,7 +17,7 @@ interface RandomOrderCustomer {
     longitude: string | number;
 }
 
-const ORDER_STATUSES = new Set(["pending", "delivered", "cancelled"]);
+const ORDER_STATUSES = ["pending", "delivered", "cancelled"];
 
 function isValidOrderDate(value: unknown): value is string {
     if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
@@ -75,21 +75,45 @@ function distanceKm(
 }
 
 function spreadCustomersByLocation(customers: RandomOrderCustomer[]): RandomOrderCustomer[] {
-    const customersByPoint = new Map<string, RandomOrderCustomer[]>();
+    const customerGroups: Array<{
+        key: string;
+        customers: RandomOrderCustomer[];
+    }> = [];
+
     for (const customer of customers) {
         const key = `${Number(customer.latitude).toFixed(6)},${Number(customer.longitude).toFixed(6)}`;
-        const group = customersByPoint.get(key) ?? [];
-        group.push(customer);
-        customersByPoint.set(key, group);
+        let group = customerGroups.find((item) => item.key === key);
+
+        if (!group) {
+            group = { key, customers: [] };
+            customerGroups.push(group);
+        }
+
+        group.customers.push(customer);
     }
 
-    const remainingPoints = shuffle(
-        [...customersByPoint.values()].map((group) => ({
-            customer: shuffle(group)[0]!,
-            latitude: Number(group[0]!.latitude),
-            longitude: Number(group[0]!.longitude)
-        }))
-    );
+    let remainingPoints: Array<{
+        customer: RandomOrderCustomer;
+        latitude: number;
+        longitude: number;
+    }> = [];
+
+    for (const group of customerGroups) {
+        const firstCustomer = group.customers[0];
+        if (!firstCustomer) continue;
+
+        const randomCustomersAtPoint = shuffle(group.customers);
+        const selectedCustomer = randomCustomersAtPoint[0];
+        if (!selectedCustomer) continue;
+
+        remainingPoints.push({
+            customer: selectedCustomer,
+            latitude: Number(firstCustomer.latitude),
+            longitude: Number(firstCustomer.longitude)
+        });
+    }
+
+    remainingPoints = shuffle(remainingPoints);
     const selectedPoints: Array<{ latitude: number; longitude: number }> = [];
     const spreadCustomers: RandomOrderCustomer[] = [];
 
@@ -114,11 +138,16 @@ function spreadCustomersByLocation(customers: RandomOrderCustomer[]): RandomOrde
         selectedPoints.push({ latitude: point.latitude, longitude: point.longitude });
     }
 
-    const selectedCustomerIds = new Set(spreadCustomers.map((customer) => customer.id));
-    const remainingCustomers = shuffle(
-        customers.filter((customer) => !selectedCustomerIds.has(customer.id))
-    );
-    return [...spreadCustomers, ...remainingCustomers];
+    const remainingCustomers: RandomOrderCustomer[] = [];
+    for (const customer of customers) {
+        const alreadySelected = spreadCustomers.some(
+            (selectedCustomer) => selectedCustomer.id === customer.id
+        );
+        if (!alreadySelected) remainingCustomers.push(customer);
+    }
+
+    const shuffledRemainingCustomers = shuffle(remainingCustomers);
+    return [...spreadCustomers, ...shuffledRemainingCustomers];
 }
 
 const ORDER_WITH_CUSTOMER_QUERY = `
@@ -330,7 +359,7 @@ export const updateOrderByID = async (req: Request,res: Response) => {
             });
         }
 
-        if (order.status !== undefined && !ORDER_STATUSES.has(order.status)) {
+        if (order.status !== undefined && !ORDER_STATUSES.includes(order.status)) {
             return res.status(400).json({
                 error: "Status must be pending, delivered or cancelled"
             });
@@ -564,10 +593,10 @@ export const randomOrder = async (req: Request,res: Response) => {
         const placeholders = values
             .map(() => "(?, ?, CURDATE(), 'pending', TRUE)")
             .join(", ");
-        const parameters = values.flatMap(([customerId, quantity]) => [
-            customerId,
-            quantity
-        ]);
+        const parameters: number[] = [];
+        for (const [customerId, quantity] of values) {
+            parameters.push(customerId, quantity);
+        }
 
         const [insertResult] = await connection.query<ResultSetHeader>(
             `INSERT INTO orders
@@ -589,14 +618,27 @@ export const randomOrder = async (req: Request,res: Response) => {
 
         const createdOrders = createdRows as OrderWithCustomerLocation[];
 
+        const uniqueCustomerIds: number[] = [];
+        const uniqueDeliveryPoints: string[] = [];
+        for (const [customerId] of values) {
+            if (!uniqueCustomerIds.includes(customerId)) {
+                uniqueCustomerIds.push(customerId);
+            }
+
+            const customer = customers.find((item) => item.id === customerId);
+            if (customer) {
+                const point = `${Number(customer.latitude).toFixed(6)},${Number(customer.longitude).toFixed(6)}`;
+                if (!uniqueDeliveryPoints.includes(point)) {
+                    uniqueDeliveryPoints.push(point);
+                }
+            }
+        }
+
         return res.status(201).json({
             message: "Random orders generated",
             amount,
-            unique_customers: new Set(values.map(([customerId]) => customerId)).size,
-            unique_delivery_points: new Set(values.map(([customerId]) => {
-                const customer = customers.find((item) => item.id === customerId)!;
-                return `${Number(customer.latitude).toFixed(6)},${Number(customer.longitude).toFixed(6)}`;
-            })).size,
+            unique_customers: uniqueCustomerIds.length,
+            unique_delivery_points: uniqueDeliveryPoints.length,
             orders: createdOrders.map(formatOrderWithCustomer)
         });
 

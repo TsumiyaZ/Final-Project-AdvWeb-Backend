@@ -106,18 +106,30 @@ function getTodayDateBangkok(): string {
   return `${part("year")}-${part("month")}-${part("day")}`;
 }
 
-function getPermutations<T>(items: T[]): T[][] {
-  if (items.length <= 1) return [items];
-
-  const permutations: T[][] = [];
-  for (let index = 0; index < items.length; index++) {
-    const first = items[index]!;
-    const rest = items.filter((_, itemIndex) => itemIndex !== index);
-    for (const tail of getPermutations(rest)) {
-      permutations.push([first, ...tail]);
-    }
+// ไรเดอร์รับได้ไม่เกิน 3 จุด จึงมีลำดับส่งให้ลองได้สูงสุด 6 แบบ
+function getStopOrders(orders: PendingOrderModel[]): PendingOrderModel[][] {
+  if (orders.length === 0) return [[]];
+  if (orders.length === 1) return [[orders[0]!]];
+  if (orders.length === 2) {
+    return [
+      [orders[0]!, orders[1]!],
+      [orders[1]!, orders[0]!]
+    ];
   }
-  return permutations;
+  if (orders.length !== 3) return [];
+
+  const first = orders[0]!;
+  const second = orders[1]!;
+  const third = orders[2]!;
+
+  return [
+    [first, second, third],
+    [first, third, second],
+    [second, first, third],
+    [second, third, first],
+    [third, first, second],
+    [third, second, first]
+  ];
 }
 
 function getRoutePathCandidates(
@@ -128,7 +140,7 @@ function getRoutePathCandidates(
 ): RoutePathResult[] {
   const candidates: RoutePathResult[] = [];
 
-  for (const orderSequence of getPermutations(routeOrders)) {
+  for (const orderSequence of getStopOrders(routeOrders)) {
     let previousPoint = 0;
     let distanceMeters = 0;
     let durationSeconds = 0;
@@ -169,18 +181,31 @@ function getBestRoutePath(
 }
 
 function getBoxDistanceScore(path: RoutePathResult): number {
-  const boxes = path.orders.reduce((sum, order) => sum + Number(order.quantity), 0);
-  return path.distanceMeters * boxes;
+  let boxCount = 0;
+  for (const order of path.orders) {
+    boxCount += Number(order.quantity);
+  }
+  return path.distanceMeters * boxCount;
 }
 
 function getPointSequence(orders: PendingOrderModel[]): string[] {
-  return orders.map((order) =>
-    `${Number(order.latitude).toFixed(6)},${Number(order.longitude).toFixed(6)}`
-  );
+  const points: string[] = [];
+  for (const order of orders) {
+    points.push(
+      `${Number(order.latitude).toFixed(6)},${Number(order.longitude).toFixed(6)}`
+    );
+  }
+  return points;
 }
 
 function getPlanPointSignature(riderIds: number[], pointSequences: string[][]): string {
-  return JSON.stringify(riderIds.map((riderId, index) => [riderId, pointSequences[index] ?? []]));
+  const riderPlans: string[] = [];
+  for (let index = 0; index < riderIds.length; index++) {
+    const riderId = riderIds[index];
+    const points = pointSequences[index] || [];
+    riderPlans.push(`${riderId}:${points.join('>')}`);
+  }
+  return riderPlans.join('|');
 }
 
 function formatSqlTime(totalMinutes: number): string {
@@ -605,11 +630,20 @@ export const calculatePlan = async (_req: Request, res: Response) => {
       const signature = getPlanPointSignature(riderIds, pointSequences);
       if (seenPlanSignatures.has(signature) || candidatePlans.has(signature)) return;
 
+      let costScore = 0;
+      let distanceMeters = 0;
+      let durationSeconds = 0;
+      for (const path of paths) {
+        costScore += getBoxDistanceScore(path);
+        distanceMeters += path.distanceMeters;
+        durationSeconds += path.durationSeconds;
+      }
+
       candidatePlans.set(signature, {
         paths,
-        costScore: paths.reduce((sum, path) => sum + getBoxDistanceScore(path), 0),
-        distanceMeters: paths.reduce((sum, path) => sum + path.distanceMeters, 0),
-        durationSeconds: paths.reduce((sum, path) => sum + path.durationSeconds, 0)
+        costScore,
+        distanceMeters,
+        durationSeconds
       });
     };
 
@@ -669,7 +703,11 @@ export const calculatePlan = async (_req: Request, res: Response) => {
       const path = routePaths[riderIndex];
       if (!path) throw new Error(`หาเส้นทางของไรเดอร์ ${rider.id} ไม่ได้`);
 
-      const totalBoxes = path.orders.reduce((sum, order) => sum + Number(order.quantity), 0);
+      let totalBoxes = 0;
+      for (const order of path.orders) {
+        totalBoxes += Number(order.quantity);
+      }
+
       return {
         rider,
         total_boxes: totalBoxes,
@@ -713,8 +751,21 @@ export const calculatePlan = async (_req: Request, res: Response) => {
     );
 
     const activeRoutes = routesWithGeometry.filter((route) => route.stops.length > 0);
-    const totalBoxes = activeRoutes.reduce((sum, route) => sum + route.total_boxes, 0);
-    const totalDistanceKm = activeRoutes.reduce((sum, route) => sum + route.distance_km, 0);
+    let totalBoxes = 0;
+    let totalDistanceKm = 0;
+    let longestRouteMinutes = 0;
+    let allOnTime = true;
+
+    for (const route of activeRoutes) {
+      totalBoxes += route.total_boxes;
+      totalDistanceKm += route.distance_km;
+      longestRouteMinutes = Math.max(longestRouteMinutes, route.travel_minutes);
+
+      if (route.travel_minutes > 60) {
+        allOnTime = false;
+      }
+    }
+
     const pricePerBox = Number(shop.price_per_box);
     const costPerBox = Number(shop.cost_per_box);
     const riderBaseFee = Number(shop.rider_base_fee);
@@ -722,13 +773,15 @@ export const calculatePlan = async (_req: Request, res: Response) => {
     const routeCosts = activeRoutes.map((route) =>
       riderBaseFee + riderPerBoxKm * route.total_boxes * route.distance_km
     );
-    const totalDeliveryCost = routeCosts.reduce((sum, cost) => sum + cost, 0);
+    let totalDeliveryCost = 0;
+    for (const cost of routeCosts) {
+      totalDeliveryCost += cost;
+    }
+
     const revenue = totalBoxes * pricePerBox;
     const foodCost = totalBoxes * costPerBox;
     const profit = revenue - foodCost - totalDeliveryCost;
-    const longestRouteMinutes = Math.max(...activeRoutes.map((route) => route.travel_minutes));
     const lastArrivalTime = formatSqlTime(11 * 60 + 30 + longestRouteMinutes);
-    const allOnTime = activeRoutes.every((route) => route.travel_minutes <= 60);
 
     const connection = await conn.getConnection();
     let planId = 0;
