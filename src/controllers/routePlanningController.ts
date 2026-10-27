@@ -24,6 +24,13 @@ interface RoutePathResult {
   durationSeconds: number;
 }
 
+interface RoutePlanCandidate {
+  paths: RoutePathResult[];
+  costScore: number;
+  distanceMeters: number;
+  durationSeconds: number;
+}
+
 interface RoadRoute {
   distance: number;
   duration: number;
@@ -113,28 +120,15 @@ function getPermutations<T>(items: T[]): T[][] {
   return permutations;
 }
 
-function getBestRoutePath(
+function getRoutePathCandidates(
   routeOrders: PendingOrderModel[],
   pointIndexes: Map<number, number>,
   distances: DistanceMatrix,
-  durations: DistanceMatrix,
-  excludedOrderSequence?: number[],
-  excludedPointSequence?: string[]
-): RoutePathResult | null {
-  let bestPath: RoutePathResult | null = null;
+  durations: DistanceMatrix
+): RoutePathResult[] {
+  const candidates: RoutePathResult[] = [];
 
   for (const orderSequence of getPermutations(routeOrders)) {
-    if (
-      excludedOrderSequence &&
-      orderSequence.length === excludedOrderSequence.length &&
-      orderSequence.every((order, index) => order.id === excludedOrderSequence[index])
-    ) {
-      continue;
-    }
-    if (excludedPointSequence && samePointSequence(getPointSequence(orderSequence), excludedPointSequence)) {
-      continue;
-    }
-
     let previousPoint = 0;
     let distanceMeters = 0;
     let durationSeconds = 0;
@@ -156,16 +150,22 @@ function getBestRoutePath(
     }
 
     if (!valid) continue;
-    if (
-      !bestPath ||
-      distanceMeters < bestPath.distanceMeters ||
-      (distanceMeters === bestPath.distanceMeters && durationSeconds < bestPath.durationSeconds)
-    ) {
-      bestPath = { orders: orderSequence, distanceMeters, durationSeconds };
-    }
+    candidates.push({ orders: orderSequence, distanceMeters, durationSeconds });
   }
 
-  return bestPath;
+  return candidates.sort((first, second) =>
+    first.distanceMeters - second.distanceMeters ||
+    first.durationSeconds - second.durationSeconds
+  );
+}
+
+function getBestRoutePath(
+  routeOrders: PendingOrderModel[],
+  pointIndexes: Map<number, number>,
+  distances: DistanceMatrix,
+  durations: DistanceMatrix
+): RoutePathResult | null {
+  return getRoutePathCandidates(routeOrders, pointIndexes, distances, durations)[0] ?? null;
 }
 
 function getBoxDistanceScore(path: RoutePathResult): number {
@@ -179,9 +179,8 @@ function getPointSequence(orders: PendingOrderModel[]): string[] {
   );
 }
 
-function samePointSequence(first: string[] | undefined, second: string[] | undefined): boolean {
-  return Boolean(first && second && first.length === second.length &&
-    first.every((point, index) => point === second[index]));
+function getPlanPointSignature(riderIds: number[], pointSequences: string[][]): string {
+  return JSON.stringify(riderIds.map((riderId, index) => [riderId, pointSequences[index] ?? []]));
 }
 
 function formatSqlTime(totalMinutes: number): string {
@@ -562,106 +561,108 @@ export const calculatePlan = async (_req: Request, res: Response) => {
       }
     }
 
-    // ถ้าผลที่คำนวณได้เหมือนแผน active เดิม ให้เลือกทางเลือกถัดไปที่ต้นทุนใกล้ที่สุด
-    const [previousStops] = await conn.query<RowDataPacket[]>(
-      `SELECT rr.rider_id, rs.order_id, rs.stop_sequence, rs.latitude, rs.longitude
+    // โหลดประวัติพิกัดของทุกแผนในวันนี้ เพื่อไม่สร้างเส้นทางเดิมซ้ำ
+    const [historyRows] = await conn.query<RowDataPacket[]>(
+      `SELECT p.id AS plan_id, rr.rider_id, rs.stop_sequence, rs.latitude, rs.longitude
        FROM delivery_plans p
        JOIN rider_routes rr ON rr.plan_id = p.id
        JOIN route_stops rs ON rs.route_id = rr.id
-       WHERE p.delivery_date = ? AND p.is_active = TRUE
-       ORDER BY rr.rider_number, rs.stop_sequence`,
+       WHERE p.delivery_date = ?
+       ORDER BY p.id, rr.rider_number, rs.stop_sequence`,
       [deliveryDate]
     );
 
-    const previousPointSequenceByRider = new Map<number, string[]>();
-    for (const stop of previousStops) {
+    const historyByPlan = new Map<number, Map<number, string[]>>();
+    for (const stop of historyRows) {
+      const planId = Number(stop.plan_id);
       const riderId = Number(stop.rider_id);
-      const pointSequence = previousPointSequenceByRider.get(riderId) ?? [];
+      const riderSequences = historyByPlan.get(planId) ?? new Map<number, string[]>();
+      const pointSequence = riderSequences.get(riderId) ?? [];
       pointSequence.push(
         `${Number(stop.latitude).toFixed(6)},${Number(stop.longitude).toFixed(6)}`
       );
-      previousPointSequenceByRider.set(riderId, pointSequence);
+      riderSequences.set(riderId, pointSequence);
+      historyByPlan.set(planId, riderSequences);
     }
 
-    const sameAsPreviousPlan = previousStops.length === orders.length &&
-      selectedRiders.every((rider, riderIndex) =>
-        samePointSequence(
-          getPointSequence(routePaths[riderIndex]!.orders),
-          previousPointSequenceByRider.get(rider.id)
-        )
+    const riderIds = selectedRiders.map((rider) => Number(rider.id));
+    const seenPlanSignatures = new Set<string>();
+    for (const riderSequences of historyByPlan.values()) {
+      const pointSequences = selectedRiders.map((rider) =>
+        riderSequences.get(Number(rider.id)) ?? []
       );
+      seenPlanSignatures.add(getPlanPointSignature(riderIds, pointSequences));
+    }
 
-    if (sameAsPreviousPlan) {
-      let bestAlternative: {
-        firstRoute: number;
-        secondRoute: number;
-        firstPath: RoutePathResult;
-        secondPath: RoutePathResult;
-        costScore: number;
-        distanceMeters: number;
-      } | null = null;
+    const optimizedPaths = routePaths.map((path) => {
+      if (!path) throw new Error("หาเส้นทางที่คำนวณไว้ไม่ครบ");
+      return path;
+    });
+    const candidatePlans = new Map<string, RoutePlanCandidate>();
 
-      for (let firstRoute = 0; firstRoute < assignedOrders.length; firstRoute++) {
-        for (let secondRoute = firstRoute + 1; secondRoute < assignedOrders.length; secondRoute++) {
-          for (let firstOrder = 0; firstOrder < assignedOrders[firstRoute]!.length; firstOrder++) {
-            for (let secondOrder = 0; secondOrder < assignedOrders[secondRoute]!.length; secondOrder++) {
-              const firstGroup = [...assignedOrders[firstRoute]!];
-              const secondGroup = [...assignedOrders[secondRoute]!];
-              [firstGroup[firstOrder], secondGroup[secondOrder]] =
-                [secondGroup[secondOrder]!, firstGroup[firstOrder]!];
+    const addCandidatePlan = (paths: RoutePathResult[]) => {
+      const pointSequences = paths.map((path) => getPointSequence(path.orders));
+      const signature = getPlanPointSignature(riderIds, pointSequences);
+      if (seenPlanSignatures.has(signature) || candidatePlans.has(signature)) return;
 
-              const firstPath = getBestRoutePath(firstGroup, pointIndexes, distances, durations);
-              const secondPath = getBestRoutePath(secondGroup, pointIndexes, distances, durations);
-              if (!firstPath || !secondPath) continue;
+      candidatePlans.set(signature, {
+        paths,
+        costScore: paths.reduce((sum, path) => sum + getBoxDistanceScore(path), 0),
+        distanceMeters: paths.reduce((sum, path) => sum + path.distanceMeters, 0),
+        durationSeconds: paths.reduce((sum, path) => sum + path.durationSeconds, 0)
+      });
+    };
 
-              const candidatePointSequences = routePaths.map((path) => getPointSequence(path!.orders));
-              candidatePointSequences[firstRoute] = getPointSequence(firstPath.orders);
-              candidatePointSequences[secondRoute] = getPointSequence(secondPath.orders);
-              const sameAsSavedGeometry = selectedRiders.every((rider, riderIndex) =>
-                samePointSequence(
-                  candidatePointSequences[riderIndex],
-                  previousPointSequenceByRider.get(rider.id)
-                )
-              );
-              if (sameAsSavedGeometry) continue;
+    // รวมแผนหลักและลำดับส่งอื่น ๆ ของแต่ละไรเดอร์
+    addCandidatePlan(optimizedPaths);
+    for (let routeIndex = 0; routeIndex < assignedOrders.length; routeIndex++) {
+      for (const path of getRoutePathCandidates(
+        assignedOrders[routeIndex]!, pointIndexes, distances, durations
+      )) {
+        const candidatePaths = [...optimizedPaths];
+        candidatePaths[routeIndex] = path;
+        addCandidatePlan(candidatePaths);
+      }
+    }
 
-              const costScore = getBoxDistanceScore(firstPath) + getBoxDistanceScore(secondPath);
-              const distanceMeters = firstPath.distanceMeters + secondPath.distanceMeters;
-              if (
-                !bestAlternative ||
-                costScore < bestAlternative.costScore ||
-                (costScore === bestAlternative.costScore && distanceMeters < bestAlternative.distanceMeters)
-              ) {
-                bestAlternative = {
-                  firstRoute,
-                  secondRoute,
-                  firstPath,
-                  secondPath,
-                  costScore,
-                  distanceMeters
-                };
-              }
-            }
+    // สร้างแผนเพิ่มจากการสลับจุดส่งระหว่างไรเดอร์ทุกคู่
+    for (let firstRoute = 0; firstRoute < assignedOrders.length; firstRoute++) {
+      for (let secondRoute = firstRoute + 1; secondRoute < assignedOrders.length; secondRoute++) {
+        for (let firstOrder = 0; firstOrder < assignedOrders[firstRoute]!.length; firstOrder++) {
+          for (let secondOrder = 0; secondOrder < assignedOrders[secondRoute]!.length; secondOrder++) {
+            const firstGroup = [...assignedOrders[firstRoute]!];
+            const secondGroup = [...assignedOrders[secondRoute]!];
+            [firstGroup[firstOrder], secondGroup[secondOrder]] =
+              [secondGroup[secondOrder]!, firstGroup[firstOrder]!];
+
+            const firstPath = getBestRoutePath(firstGroup, pointIndexes, distances, durations);
+            const secondPath = getBestRoutePath(secondGroup, pointIndexes, distances, durations);
+            if (!firstPath || !secondPath) continue;
+
+            const candidatePaths = [...optimizedPaths];
+            candidatePaths[firstRoute] = firstPath;
+            candidatePaths[secondRoute] = secondPath;
+            addCandidatePlan(candidatePaths);
           }
         }
       }
+    }
 
-      if (bestAlternative) {
-        assignedOrders[bestAlternative.firstRoute] = bestAlternative.firstPath.orders;
-        assignedOrders[bestAlternative.secondRoute] = bestAlternative.secondPath.orders;
-        routePaths[bestAlternative.firstRoute] = bestAlternative.firstPath;
-        routePaths[bestAlternative.secondRoute] = bestAlternative.secondPath;
-      } else if (assignedOrders.length === 1) {
-        const riderId = selectedRiders[0]!.id;
-        const previousPointSequence = previousPointSequenceByRider.get(riderId);
-        const alternativePath = getBestRoutePath(
-          assignedOrders[0]!, pointIndexes, distances, durations, undefined, previousPointSequence
-        );
-        if (alternativePath) {
-          assignedOrders[0] = alternativePath.orders;
-          routePaths[0] = alternativePath;
-        }
-      }
+    const nextPlan = [...candidatePlans.values()].sort((first, second) =>
+      first.costScore - second.costScore ||
+      first.distanceMeters - second.distanceMeters ||
+      first.durationSeconds - second.durationSeconds
+    )[0];
+
+    if (!nextPlan) {
+      return res.status(409).json({
+        error: "ไม่มีแผนเส้นทางใหม่จากชุดออเดอร์ปัจจุบันแล้ว ลองเพิ่มหรือเปลี่ยนพิกัดออเดอร์"
+      });
+    }
+
+    routePaths = nextPlan.paths;
+    for (let routeIndex = 0; routeIndex < routePaths.length; routeIndex++) {
+      assignedOrders[routeIndex] = routePaths[routeIndex]!.orders;
     }
 
     const routes = selectedRiders.map((rider, riderIndex) => {
