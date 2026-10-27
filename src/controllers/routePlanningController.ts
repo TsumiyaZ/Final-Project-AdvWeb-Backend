@@ -88,6 +88,17 @@ function isValidDateStr(value: string): boolean {
   return /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(value));
 }
 
+function getTodayDateBangkok(): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Bangkok",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(new Date());
+  const part = (type: string) => parts.find((item) => item.type === type)?.value ?? "";
+  return `${part("year")}-${part("month")}-${part("day")}`;
+}
+
 function getPermutations<T>(items: T[]): T[][] {
   if (items.length <= 1) return [items];
 
@@ -211,21 +222,8 @@ export const getPendingOrders = async (req: Request, res: Response) => {
   }
 };
 
-export const calculatePlan = async (req: Request, res: Response) => {
-  const deliveryDate = String(req.body.delivery_date ?? '').trim();
-  const riderCount = Number(req.body.rider_count);
-
-  if (!isValidDateStr(deliveryDate)) {
-    return res.status(400).json({
-      error: 'delivery_date ต้องเป็นวันที่รูปแบบ YYYY-MM-DD'
-    });
-  }
-
-  if (!Number.isInteger(riderCount) || riderCount < 1 || riderCount > 10) {
-    return res.status(400).json({
-      error: 'rider_count ต้องเป็นจำนวนเต็มระหว่าง 1 ถึง 10'
-    });
-  }
+export const calculatePlan = async (_req: Request, res: Response) => {
+  const deliveryDate = getTodayDateBangkok();
 
   try {
     const [shopRows] = await conn.query(
@@ -261,6 +259,13 @@ export const calculatePlan = async (req: Request, res: Response) => {
       });
     }
 
+    const riderCount = Math.ceil(orders.length / 3);
+    if (riderCount > 10) {
+      return res.status(400).json({
+        error: `มี ${orders.length} ออเดอร์ ต้องใช้ไรเดอร์ ${riderCount} คน ซึ่งเกินขีดจำกัด 10 คน (สูงสุด 30 ออเดอร์)`
+      });
+    }
+
     const [ridersQuery] = await conn.query(
       'SELECT id, name, phone FROM riders ORDER BY id'
     );
@@ -269,13 +274,7 @@ export const calculatePlan = async (req: Request, res: Response) => {
 
     if (riders.length < riderCount) {
       return res.status(400).json({
-        error: `เลือกไรเดอร์ ${riderCount} คน แต่ในระบบมีแค่ ${riders.length} คน`
-      });
-    }
-
-    if (orders.length > riderCount * 3) {
-      return res.status(400).json({
-        error: `มี ${orders.length} ออเดอร์ แต่ไรเดอร์ ${riderCount} คนรับได้สูงสุด ${riderCount * 3} จุด`
+        error: `ออเดอร์ ${orders.length} รายการต้องใช้ไรเดอร์ ${riderCount} คน แต่ในระบบมีแค่ ${riders.length} คน`
       });
     }
 
