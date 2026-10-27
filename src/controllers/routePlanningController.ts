@@ -1,6 +1,6 @@
 import { Request, Response } from "express";
 import { conn } from "../config/dbconnect";
-import { ResultSetHeader } from "mysql2";
+import { ResultSetHeader, RowDataPacket } from "mysql2";
 import { ShopModel } from "../models/deliveryPlanModel";
 import { RiderModel } from "../models/riderModel";
 import { PendingOrderModel } from "../models/orderModel";
@@ -219,6 +219,130 @@ export const getPendingOrders = async (req: Request, res: Response) => {
   } catch (err: unknown) {
     console.error("getPendingOrders:", err);
     return res.status(500).json({ error: "Database error" });
+  }
+};
+
+// ---------- GET /api/plans/current ----------
+export const getCurrentPlan = async (_req: Request, res: Response) => {
+  try {
+    const deliveryDate = getTodayDateBangkok();
+    const [planRows] = await conn.query<RowDataPacket[]>(
+      `SELECT id, DATE_FORMAT(delivery_date, '%Y-%m-%d') AS delivery_date,
+              rider_count, total_orders, total_boxes, distance_km, delivery_cost,
+              revenue, food_cost, profit, TIME_FORMAT(last_arrival_time, '%H:%i:%s') AS last_arrival_time,
+              all_on_time
+       FROM delivery_plans
+       WHERE delivery_date = ? AND is_active = TRUE
+       ORDER BY id DESC
+       LIMIT 1`,
+      [deliveryDate]
+    );
+
+    const plan = planRows[0];
+    if (!plan) {
+      return res.status(404).json({ error: 'วันนี้ยังไม่มีแผนจัดส่ง' });
+    }
+
+    const [routeRows] = await conn.query<RowDataPacket[]>(
+      `SELECT rr.id AS route_id, rr.plan_id, rr.rider_number, rr.job_code,
+              rr.color, rr.total_boxes, rr.distance_km,
+              rr.duration_minutes AS travel_minutes, rr.delivery_cost,
+              rr.geometry, rr.navigation_url,
+              r.id AS rider_id, r.name AS rider_name, r.phone AS rider_phone
+       FROM rider_routes rr
+       JOIN riders r ON r.id = rr.rider_id
+       WHERE rr.plan_id = ?
+       ORDER BY rr.rider_number`,
+      [plan.id]
+    );
+
+    const routeIds = routeRows.map((route) => Number(route.route_id));
+    let stopsByRoute = new Map<number, RowDataPacket[]>();
+
+    if (routeIds.length > 0) {
+      const placeholders = routeIds.map(() => '?').join(', ');
+      const [stopRows] = await conn.query<RowDataPacket[]>(
+        `SELECT rs.route_id, rs.order_id AS id, o.customer_id,
+                rs.stop_sequence, rs.customer_name, rs.phone, rs.address,
+                rs.latitude, rs.longitude, rs.quantity,
+                TIME_FORMAT(rs.arrival_time, '%H:%i:%s') AS arrival_time,
+                rs.distance_from_previous_km
+         FROM route_stops rs
+         JOIN orders o ON o.id = rs.order_id
+         WHERE rs.route_id IN (${placeholders})
+         ORDER BY rs.route_id, rs.stop_sequence`,
+        routeIds
+      );
+
+      stopsByRoute = new Map<number, RowDataPacket[]>();
+      for (const stop of stopRows) {
+        const routeId = Number(stop.route_id);
+        const routeStops = stopsByRoute.get(routeId) ?? [];
+        routeStops.push(stop);
+        stopsByRoute.set(routeId, routeStops);
+      }
+    }
+
+    const routes = routeRows.map((route) => {
+      let geometry: unknown = route.geometry;
+      if (typeof geometry === 'string') {
+        try {
+          geometry = JSON.parse(geometry);
+        } catch {
+          geometry = [];
+        }
+      }
+
+      return {
+        plan_id: Number(route.plan_id),
+        route_id: Number(route.route_id),
+        job_code: route.job_code,
+        color: route.color,
+        delivery_cost: Number(route.delivery_cost),
+        navigation_url: route.navigation_url,
+        rider: {
+          id: Number(route.rider_id),
+          name: route.rider_name,
+          phone: route.rider_phone
+        },
+        total_boxes: Number(route.total_boxes),
+        stops: (stopsByRoute.get(Number(route.route_id)) ?? []).map((stop) => ({
+          id: Number(stop.id),
+          customer_id: Number(stop.customer_id),
+          quantity: Number(stop.quantity),
+          customer_name: stop.customer_name,
+          phone: stop.phone,
+          address: stop.address,
+          latitude: Number(stop.latitude),
+          longitude: Number(stop.longitude),
+          stop_sequence: Number(stop.stop_sequence),
+          arrival_time: stop.arrival_time,
+          distance_from_previous_km: Number(stop.distance_from_previous_km)
+        })),
+        distance_km: Number(route.distance_km),
+        travel_minutes: Number(route.travel_minutes),
+        geometry
+      };
+    });
+
+    return res.json({
+      plan_id: Number(plan.id),
+      delivery_date: plan.delivery_date,
+      rider_count: Number(plan.rider_count),
+      total_orders: Number(plan.total_orders),
+      total_boxes: Number(plan.total_boxes),
+      distance_km: Number(plan.distance_km),
+      delivery_cost: Number(plan.delivery_cost),
+      revenue: Number(plan.revenue),
+      food_cost: Number(plan.food_cost),
+      profit: Number(plan.profit),
+      last_arrival_time: plan.last_arrival_time,
+      all_on_time: Boolean(plan.all_on_time),
+      routes
+    });
+  } catch (error: unknown) {
+    console.error('getCurrentPlan:', error);
+    return res.status(500).json({ error: 'โหลดแผนจัดส่งปัจจุบันไม่สำเร็จ' });
   }
 };
 
