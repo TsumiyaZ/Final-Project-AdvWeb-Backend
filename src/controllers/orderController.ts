@@ -11,6 +11,12 @@ interface OrderWithCustomerLocation extends OrderModel {
     customer_longitude: string;
 }
 
+interface RandomOrderCustomer {
+    id: number;
+    latitude: string | number;
+    longitude: string | number;
+}
+
 const ORDER_STATUSES = new Set(["pending", "delivered", "cancelled"]);
 
 function isValidOrderDate(value: unknown): value is string {
@@ -43,6 +49,76 @@ function formatOrderWithCustomer(order: OrderWithCustomerLocation) {
             longitude: order.customer_longitude
         }
     };
+}
+
+function shuffle<T>(items: T[]): T[] {
+    const shuffled = [...items];
+    for (let index = shuffled.length - 1; index > 0; index--) {
+        const swapIndex = Math.floor(Math.random() * (index + 1));
+        [shuffled[index], shuffled[swapIndex]] = [shuffled[swapIndex]!, shuffled[index]!];
+    }
+    return shuffled;
+}
+
+function distanceKm(
+    first: { latitude: number; longitude: number },
+    second: { latitude: number; longitude: number }
+): number {
+    const radians = (degrees: number) => degrees * Math.PI / 180;
+    const latitudeDifference = radians(second.latitude - first.latitude);
+    const longitudeDifference = radians(second.longitude - first.longitude);
+    const haversine = Math.sin(latitudeDifference / 2) ** 2 +
+        Math.cos(radians(first.latitude)) * Math.cos(radians(second.latitude)) *
+        Math.sin(longitudeDifference / 2) ** 2;
+    const safeHaversine = Math.min(1, haversine);
+    return 6371 * 2 * Math.atan2(Math.sqrt(safeHaversine), Math.sqrt(1 - safeHaversine));
+}
+
+function spreadCustomersByLocation(customers: RandomOrderCustomer[]): RandomOrderCustomer[] {
+    const customersByPoint = new Map<string, RandomOrderCustomer[]>();
+    for (const customer of customers) {
+        const key = `${Number(customer.latitude).toFixed(6)},${Number(customer.longitude).toFixed(6)}`;
+        const group = customersByPoint.get(key) ?? [];
+        group.push(customer);
+        customersByPoint.set(key, group);
+    }
+
+    const remainingPoints = shuffle(
+        [...customersByPoint.values()].map((group) => ({
+            customer: shuffle(group)[0]!,
+            latitude: Number(group[0]!.latitude),
+            longitude: Number(group[0]!.longitude)
+        }))
+    );
+    const selectedPoints: Array<{ latitude: number; longitude: number }> = [];
+    const spreadCustomers: RandomOrderCustomer[] = [];
+
+    while (remainingPoints.length > 0) {
+        let selectedIndex = 0;
+        if (selectedPoints.length > 0) {
+            const rankedPoints = remainingPoints
+                .map((point, index) => ({
+                    index,
+                    minDistance: Math.min(...selectedPoints.map((selected) =>
+                        distanceKm(point, selected)
+                    ))
+                }))
+                .sort((first, second) => second.minDistance - first.minDistance);
+            const topChoices = rankedPoints.slice(0, Math.min(3, rankedPoints.length));
+            selectedIndex = topChoices[Math.floor(Math.random() * topChoices.length)]!.index;
+        }
+
+        const [point] = remainingPoints.splice(selectedIndex, 1);
+        if (!point) continue;
+        spreadCustomers.push(point.customer);
+        selectedPoints.push({ latitude: point.latitude, longitude: point.longitude });
+    }
+
+    const selectedCustomerIds = new Set(spreadCustomers.map((customer) => customer.id));
+    const remainingCustomers = shuffle(
+        customers.filter((customer) => !selectedCustomerIds.has(customer.id))
+    );
+    return [...spreadCustomers, ...remainingCustomers];
 }
 
 const ORDER_WITH_CUSTOMER_QUERY = `
@@ -440,31 +516,49 @@ export const randomOrder = async (req: Request,res: Response) => {
         connection = await conn.getConnection();
         await connection.beginTransaction();
 
-        const [rows] = await connection.query('SELECT id FROM customers');
+        const [shopRows] = await connection.query<RowDataPacket[]>(
+            "SELECT latitude, longitude FROM shops WHERE id = 1"
+        );
+        const shop = shopRows[0];
+        if (!shop) {
+            await connection.rollback();
+            return res.status(404).json({ error: "Shop not found" });
+        }
 
-        const customers = rows as {id: number}[];
+        const [rows] = await connection.query<RowDataPacket[]>(
+            `SELECT c.id, c.latitude, c.longitude
+             FROM customers c
+             WHERE ST_Distance_Sphere(
+                 POINT(IF(c.longitude = -180, 180, c.longitude), c.latitude),
+                 POINT(?, ?)
+             ) <= 3000`,
+            [Number(shop.longitude) === -180 ? 180 : Number(shop.longitude), Number(shop.latitude)]
+        );
+
+        const customers = (rows as RandomOrderCustomer[]).map((customer) => ({
+            ...customer,
+            id: Number(customer.id)
+        }));
 
         if (customers.length === 0) {
             await connection.rollback();
             return res.status(400).json({
-                error: "No customers available"
+                error: "No customers found within 3 km of the shop"
             }); 
         }
 
+        // เลือกพิกัดให้กระจายก่อน แล้วค่อยเลือกหลาย customer ที่พิกัดเดียวกัน
+        // หากจำนวนออเดอร์มากกว่าจำนวน customer จึงวนซ้ำให้จำนวนออเดอร์สมดุล
+        const customerSequence = spreadCustomersByLocation(customers);
         const values: Array<[number, number]> = [];
 
         for (let i = 0; i < amount; i++) {
-            const randomCustomer =
-                customers[
-                    Math.floor(
-                        Math.random() * customers.length
-                    )
-                ];
+            const randomCustomer = customerSequence[i % customerSequence.length]!;
 
             const quantity =
                 Math.floor(Math.random() * 3) + 1;
 
-            values.push([randomCustomer!.id, quantity]);
+            values.push([randomCustomer.id, quantity]);
         }
 
         const placeholders = values
@@ -498,6 +592,11 @@ export const randomOrder = async (req: Request,res: Response) => {
         return res.status(201).json({
             message: "Random orders generated",
             amount,
+            unique_customers: new Set(values.map(([customerId]) => customerId)).size,
+            unique_delivery_points: new Set(values.map(([customerId]) => {
+                const customer = customers.find((item) => item.id === customerId)!;
+                return `${Number(customer.latitude).toFixed(6)},${Number(customer.longitude).toFixed(6)}`;
+            })).size,
             orders: createdOrders.map(formatOrderWithCustomer)
         });
 
