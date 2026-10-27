@@ -118,7 +118,8 @@ function getBestRoutePath(
   pointIndexes: Map<number, number>,
   distances: DistanceMatrix,
   durations: DistanceMatrix,
-  excludedOrderSequence?: number[]
+  excludedOrderSequence?: number[],
+  excludedPointSequence?: string[]
 ): RoutePathResult | null {
   let bestPath: RoutePathResult | null = null;
 
@@ -128,6 +129,9 @@ function getBestRoutePath(
       orderSequence.length === excludedOrderSequence.length &&
       orderSequence.every((order, index) => order.id === excludedOrderSequence[index])
     ) {
+      continue;
+    }
+    if (excludedPointSequence && samePointSequence(getPointSequence(orderSequence), excludedPointSequence)) {
       continue;
     }
 
@@ -167,6 +171,17 @@ function getBestRoutePath(
 function getBoxDistanceScore(path: RoutePathResult): number {
   const boxes = path.orders.reduce((sum, order) => sum + Number(order.quantity), 0);
   return path.distanceMeters * boxes;
+}
+
+function getPointSequence(orders: PendingOrderModel[]): string[] {
+  return orders.map((order) =>
+    `${Number(order.latitude).toFixed(6)},${Number(order.longitude).toFixed(6)}`
+  );
+}
+
+function samePointSequence(first: string[] | undefined, second: string[] | undefined): boolean {
+  return Boolean(first && second && first.length === second.length &&
+    first.every((point, index) => point === second[index]));
 }
 
 function formatSqlTime(totalMinutes: number): string {
@@ -549,7 +564,7 @@ export const calculatePlan = async (_req: Request, res: Response) => {
 
     // ถ้าผลที่คำนวณได้เหมือนแผน active เดิม ให้เลือกทางเลือกถัดไปที่ต้นทุนใกล้ที่สุด
     const [previousStops] = await conn.query<RowDataPacket[]>(
-      `SELECT rr.rider_id, rs.order_id, rs.stop_sequence
+      `SELECT rr.rider_id, rs.order_id, rs.stop_sequence, rs.latitude, rs.longitude
        FROM delivery_plans p
        JOIN rider_routes rr ON rr.plan_id = p.id
        JOIN route_stops rs ON rs.route_id = rr.id
@@ -558,24 +573,23 @@ export const calculatePlan = async (_req: Request, res: Response) => {
       [deliveryDate]
     );
 
-    const previousRiderByOrder = new Map<number, number>();
-    const previousSequenceByRider = new Map<number, number[]>();
+    const previousPointSequenceByRider = new Map<number, string[]>();
     for (const stop of previousStops) {
       const riderId = Number(stop.rider_id);
-      const orderId = Number(stop.order_id);
-      previousRiderByOrder.set(orderId, riderId);
-      const sequence = previousSequenceByRider.get(riderId) ?? [];
-      sequence.push(orderId);
-      previousSequenceByRider.set(riderId, sequence);
+      const pointSequence = previousPointSequenceByRider.get(riderId) ?? [];
+      pointSequence.push(
+        `${Number(stop.latitude).toFixed(6)},${Number(stop.longitude).toFixed(6)}`
+      );
+      previousPointSequenceByRider.set(riderId, pointSequence);
     }
 
     const sameAsPreviousPlan = previousStops.length === orders.length &&
-      orders.every((order) => {
-        const assignedRider = selectedRiders.find((rider, riderIndex) =>
-          assignedOrders[riderIndex]!.some((assignedOrder) => assignedOrder.id === order.id)
-        );
-        return assignedRider?.id === previousRiderByOrder.get(order.id);
-      });
+      selectedRiders.every((rider, riderIndex) =>
+        samePointSequence(
+          getPointSequence(routePaths[riderIndex]!.orders),
+          previousPointSequenceByRider.get(rider.id)
+        )
+      );
 
     if (sameAsPreviousPlan) {
       let bestAlternative: {
@@ -599,6 +613,17 @@ export const calculatePlan = async (_req: Request, res: Response) => {
               const firstPath = getBestRoutePath(firstGroup, pointIndexes, distances, durations);
               const secondPath = getBestRoutePath(secondGroup, pointIndexes, distances, durations);
               if (!firstPath || !secondPath) continue;
+
+              const candidatePointSequences = routePaths.map((path) => getPointSequence(path!.orders));
+              candidatePointSequences[firstRoute] = getPointSequence(firstPath.orders);
+              candidatePointSequences[secondRoute] = getPointSequence(secondPath.orders);
+              const sameAsSavedGeometry = selectedRiders.every((rider, riderIndex) =>
+                samePointSequence(
+                  candidatePointSequences[riderIndex],
+                  previousPointSequenceByRider.get(rider.id)
+                )
+              );
+              if (sameAsSavedGeometry) continue;
 
               const costScore = getBoxDistanceScore(firstPath) + getBoxDistanceScore(secondPath);
               const distanceMeters = firstPath.distanceMeters + secondPath.distanceMeters;
@@ -628,9 +653,9 @@ export const calculatePlan = async (_req: Request, res: Response) => {
         routePaths[bestAlternative.secondRoute] = bestAlternative.secondPath;
       } else if (assignedOrders.length === 1) {
         const riderId = selectedRiders[0]!.id;
-        const previousSequence = previousSequenceByRider.get(riderId);
+        const previousPointSequence = previousPointSequenceByRider.get(riderId);
         const alternativePath = getBestRoutePath(
-          assignedOrders[0]!, pointIndexes, distances, durations, previousSequence
+          assignedOrders[0]!, pointIndexes, distances, durations, undefined, previousPointSequence
         );
         if (alternativePath) {
           assignedOrders[0] = alternativePath.orders;
