@@ -1,6 +1,7 @@
 import { Request, Response } from "express";
 import { conn } from "../config/dbconnect";
-import { RowDataPacket } from "mysql2";
+import { ResultSetHeader, RowDataPacket } from "mysql2";
+import type { PoolConnection } from "mysql2/promise";
 
 interface JobRecord extends RowDataPacket {
   route_id: number;
@@ -64,9 +65,13 @@ export const getJobByCode = async (req: Request, res: Response) => {
     if (!job) return res.status(404).json({ error: "Job not found" });
 
     const [stops] = await conn.query<RowDataPacket[]>(
-      `SELECT order_id, stop_sequence, customer_name, phone, address,
-              latitude, longitude, quantity, arrival_time, distance_from_previous_km
-       FROM route_stops WHERE route_id = ? ORDER BY stop_sequence`,
+      `SELECT rs.order_id, rs.stop_sequence, rs.customer_name, rs.phone, rs.address,
+              rs.latitude, rs.longitude, rs.quantity, rs.arrival_time,
+              rs.distance_from_previous_km, o.status
+       FROM route_stops rs
+       JOIN orders o ON o.id = rs.order_id
+       WHERE rs.route_id = ?
+       ORDER BY rs.stop_sequence`,
       [job.route_id]
     );
     job.stops = stops;
@@ -82,5 +87,78 @@ export const getJobByCode = async (req: Request, res: Response) => {
   } catch (err: unknown) {
     console.error("getJobByCode:", err);
     return res.status(500).json({ error: "Database error" });
+  }
+};
+
+// POST /api/jobs/:code/stops/:orderId/complete
+export const markStopDelivered = async (req: Request, res: Response) => {
+  const jobCode = String(req.params.code ?? "").trim();
+  const orderIdText = String(req.params.orderId ?? "");
+
+  if (!jobCode || !/^[1-9]\d*$/.test(orderIdText)) {
+    return res.status(400).json({ error: "Invalid job code or order ID" });
+  }
+
+  let connection: PoolConnection | undefined;
+
+  try {
+    connection = await conn.getConnection();
+    await connection.beginTransaction();
+
+    const [rows] = await connection.query<RowDataPacket[]>(
+      `SELECT o.id, o.status
+       FROM rider_routes rr
+       JOIN delivery_plans p ON p.id = rr.plan_id
+       JOIN route_stops rs ON rs.route_id = rr.id
+       JOIN orders o ON o.id = rs.order_id
+       WHERE rr.job_code = ?
+         AND p.is_active = TRUE
+         AND o.id = ?
+       FOR UPDATE`,
+      [jobCode, Number(orderIdText)]
+    );
+
+    const order = rows[0];
+    if (!order) {
+      await connection.rollback();
+      return res.status(404).json({ error: "Order was not found in this active job" });
+    }
+
+    if (order.status === "cancelled") {
+      await connection.rollback();
+      return res.status(409).json({ error: "Cancelled orders cannot be marked as delivered" });
+    }
+
+    if (order.status === "delivered") {
+      await connection.commit();
+      return res.json({
+        message: "Order was already delivered",
+        order_id: Number(order.id),
+        status: "delivered"
+      });
+    }
+
+    const [result] = await connection.query<ResultSetHeader>(
+      "UPDATE orders SET status = 'delivered' WHERE id = ? AND status = 'pending'",
+      [Number(order.id)]
+    );
+
+    if (result.affectedRows !== 1) {
+      await connection.rollback();
+      return res.status(409).json({ error: "Order status changed. Reload the job and try again" });
+    }
+
+    await connection.commit();
+    return res.json({
+      message: "Order marked as delivered",
+      order_id: Number(order.id),
+      status: "delivered"
+    });
+  } catch (err: unknown) {
+    if (connection) await connection.rollback();
+    console.error("markStopDelivered:", err);
+    return res.status(500).json({ error: "Database error" });
+  } finally {
+    connection?.release();
   }
 };
