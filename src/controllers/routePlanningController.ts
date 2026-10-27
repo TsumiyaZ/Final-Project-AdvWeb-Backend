@@ -117,11 +117,20 @@ function getBestRoutePath(
   routeOrders: PendingOrderModel[],
   pointIndexes: Map<number, number>,
   distances: DistanceMatrix,
-  durations: DistanceMatrix
+  durations: DistanceMatrix,
+  excludedOrderSequence?: number[]
 ): RoutePathResult | null {
   let bestPath: RoutePathResult | null = null;
 
   for (const orderSequence of getPermutations(routeOrders)) {
+    if (
+      excludedOrderSequence &&
+      orderSequence.length === excludedOrderSequence.length &&
+      orderSequence.every((order, index) => order.id === excludedOrderSequence[index])
+    ) {
+      continue;
+    }
+
     let previousPoint = 0;
     let distanceMeters = 0;
     let durationSeconds = 0;
@@ -535,6 +544,98 @@ export const calculatePlan = async (_req: Request, res: Response) => {
         routePaths[bestSwap.firstRoute] = bestSwap.firstPath;
         routePaths[bestSwap.secondRoute] = bestSwap.secondPath;
         improved = true;
+      }
+    }
+
+    // ถ้าผลที่คำนวณได้เหมือนแผน active เดิม ให้เลือกทางเลือกถัดไปที่ต้นทุนใกล้ที่สุด
+    const [previousStops] = await conn.query<RowDataPacket[]>(
+      `SELECT rr.rider_id, rs.order_id, rs.stop_sequence
+       FROM delivery_plans p
+       JOIN rider_routes rr ON rr.plan_id = p.id
+       JOIN route_stops rs ON rs.route_id = rr.id
+       WHERE p.delivery_date = ? AND p.is_active = TRUE
+       ORDER BY rr.rider_number, rs.stop_sequence`,
+      [deliveryDate]
+    );
+
+    const previousRiderByOrder = new Map<number, number>();
+    const previousSequenceByRider = new Map<number, number[]>();
+    for (const stop of previousStops) {
+      const riderId = Number(stop.rider_id);
+      const orderId = Number(stop.order_id);
+      previousRiderByOrder.set(orderId, riderId);
+      const sequence = previousSequenceByRider.get(riderId) ?? [];
+      sequence.push(orderId);
+      previousSequenceByRider.set(riderId, sequence);
+    }
+
+    const sameAsPreviousPlan = previousStops.length === orders.length &&
+      orders.every((order) => {
+        const assignedRider = selectedRiders.find((rider, riderIndex) =>
+          assignedOrders[riderIndex]!.some((assignedOrder) => assignedOrder.id === order.id)
+        );
+        return assignedRider?.id === previousRiderByOrder.get(order.id);
+      });
+
+    if (sameAsPreviousPlan) {
+      let bestAlternative: {
+        firstRoute: number;
+        secondRoute: number;
+        firstPath: RoutePathResult;
+        secondPath: RoutePathResult;
+        costScore: number;
+        distanceMeters: number;
+      } | null = null;
+
+      for (let firstRoute = 0; firstRoute < assignedOrders.length; firstRoute++) {
+        for (let secondRoute = firstRoute + 1; secondRoute < assignedOrders.length; secondRoute++) {
+          for (let firstOrder = 0; firstOrder < assignedOrders[firstRoute]!.length; firstOrder++) {
+            for (let secondOrder = 0; secondOrder < assignedOrders[secondRoute]!.length; secondOrder++) {
+              const firstGroup = [...assignedOrders[firstRoute]!];
+              const secondGroup = [...assignedOrders[secondRoute]!];
+              [firstGroup[firstOrder], secondGroup[secondOrder]] =
+                [secondGroup[secondOrder]!, firstGroup[firstOrder]!];
+
+              const firstPath = getBestRoutePath(firstGroup, pointIndexes, distances, durations);
+              const secondPath = getBestRoutePath(secondGroup, pointIndexes, distances, durations);
+              if (!firstPath || !secondPath) continue;
+
+              const costScore = getBoxDistanceScore(firstPath) + getBoxDistanceScore(secondPath);
+              const distanceMeters = firstPath.distanceMeters + secondPath.distanceMeters;
+              if (
+                !bestAlternative ||
+                costScore < bestAlternative.costScore ||
+                (costScore === bestAlternative.costScore && distanceMeters < bestAlternative.distanceMeters)
+              ) {
+                bestAlternative = {
+                  firstRoute,
+                  secondRoute,
+                  firstPath,
+                  secondPath,
+                  costScore,
+                  distanceMeters
+                };
+              }
+            }
+          }
+        }
+      }
+
+      if (bestAlternative) {
+        assignedOrders[bestAlternative.firstRoute] = bestAlternative.firstPath.orders;
+        assignedOrders[bestAlternative.secondRoute] = bestAlternative.secondPath.orders;
+        routePaths[bestAlternative.firstRoute] = bestAlternative.firstPath;
+        routePaths[bestAlternative.secondRoute] = bestAlternative.secondPath;
+      } else if (assignedOrders.length === 1) {
+        const riderId = selectedRiders[0]!.id;
+        const previousSequence = previousSequenceByRider.get(riderId);
+        const alternativePath = getBestRoutePath(
+          assignedOrders[0]!, pointIndexes, distances, durations, previousSequence
+        );
+        if (alternativePath) {
+          assignedOrders[0] = alternativePath.orders;
+          routePaths[0] = alternativePath;
+        }
       }
     }
 
