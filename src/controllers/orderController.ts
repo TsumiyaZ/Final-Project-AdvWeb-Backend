@@ -32,6 +32,21 @@ function isValidOrderDate(value: unknown): value is string {
         parsedDate.getUTCDate() === day;
 }
 
+function getTodayDateBangkok(): string {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Asia/Bangkok",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit"
+    }).formatToParts(new Date());
+
+    const year = parts.find((part) => part.type === "year")?.value ?? "";
+    const month = parts.find((part) => part.type === "month")?.value ?? "";
+    const day = parts.find((part) => part.type === "day")?.value ?? "";
+
+    return `${year}-${month}-${day}`;
+}
+
 function formatOrderWithCustomer(order: OrderWithCustomerLocation) {
     return {
         id: order.id,
@@ -542,6 +557,9 @@ export const randomOrder = async (req: Request,res: Response) => {
             });
         }
 
+        // ใช้วันของไทยให้ตรงกับวันที่หน้าแผนเส้นทางนำไปค้นหา
+        const orderDate = getTodayDateBangkok();
+
         connection = await conn.getConnection();
         await connection.beginTransaction();
 
@@ -591,11 +609,11 @@ export const randomOrder = async (req: Request,res: Response) => {
         }
 
         const placeholders = values
-            .map(() => "(?, ?, CURDATE(), 'pending', TRUE)")
+            .map(() => "(?, ?, ?, 'pending', TRUE)")
             .join(", ");
-        const parameters: number[] = [];
+        const parameters: (number | string)[] = [];
         for (const [customerId, quantity] of values) {
-            parameters.push(customerId, quantity);
+            parameters.push(customerId, quantity, orderDate);
         }
 
         const [insertResult] = await connection.query<ResultSetHeader>(
