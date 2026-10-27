@@ -16,6 +16,14 @@ interface RoadMatrixResponse {
   durations?: (number | null)[][];
 }
 
+type DistanceMatrix = (number | null)[][];
+
+interface RoutePathResult {
+  orders: PendingOrderModel[];
+  distanceMeters: number;
+  durationSeconds: number;
+}
+
 interface RoadRoute {
   distance: number;
   duration: number;
@@ -78,6 +86,67 @@ async function getRoadMatrix(points: RoutePoint[]) {
 
 function isValidDateStr(value: string): boolean {
   return /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(value));
+}
+
+function getPermutations<T>(items: T[]): T[][] {
+  if (items.length <= 1) return [items];
+
+  const permutations: T[][] = [];
+  for (let index = 0; index < items.length; index++) {
+    const first = items[index]!;
+    const rest = items.filter((_, itemIndex) => itemIndex !== index);
+    for (const tail of getPermutations(rest)) {
+      permutations.push([first, ...tail]);
+    }
+  }
+  return permutations;
+}
+
+function getBestRoutePath(
+  routeOrders: PendingOrderModel[],
+  pointIndexes: Map<number, number>,
+  distances: DistanceMatrix,
+  durations: DistanceMatrix
+): RoutePathResult | null {
+  let bestPath: RoutePathResult | null = null;
+
+  for (const orderSequence of getPermutations(routeOrders)) {
+    let previousPoint = 0;
+    let distanceMeters = 0;
+    let durationSeconds = 0;
+    let valid = true;
+
+    for (const order of orderSequence) {
+      const pointIndex = pointIndexes.get(order.id);
+      const distance = pointIndex === undefined ? null : distances[previousPoint]?.[pointIndex];
+      const duration = pointIndex === undefined ? null : durations[previousPoint]?.[pointIndex];
+
+      if (distance == null || duration == null) {
+        valid = false;
+        break;
+      }
+
+      distanceMeters += distance;
+      durationSeconds += duration;
+      previousPoint = pointIndex!;
+    }
+
+    if (!valid) continue;
+    if (
+      !bestPath ||
+      distanceMeters < bestPath.distanceMeters ||
+      (distanceMeters === bestPath.distanceMeters && durationSeconds < bestPath.durationSeconds)
+    ) {
+      bestPath = { orders: orderSequence, distanceMeters, durationSeconds };
+    }
+  }
+
+  return bestPath;
+}
+
+function getBoxDistanceScore(path: RoutePathResult): number {
+  const boxes = path.orders.reduce((sum, order) => sum + Number(order.quantity), 0);
+  return path.distanceMeters * boxes;
 }
 
 function formatSqlTime(totalMinutes: number): string {
@@ -223,80 +292,145 @@ export const calculatePlan = async (req: Request, res: Response) => {
 
     const { distances, durations } = await getRoadMatrix(routePoints);
 
-    const remainingOrders = orders.map((order, index) => ({
-      order,
-      pointIndex: index + 1,
-    }));
+    const pointIndexes = new Map(orders.map((order, index) => [order.id, index + 1]));
+    const activeRiderCount = Math.min(riderCount, orders.length);
+    const selectedRiders = riders.slice(0, activeRiderCount);
+    const baseStopsPerRider = Math.floor(orders.length / activeRiderCount);
+    const extraStops = orders.length % activeRiderCount;
+    const targetStops = selectedRiders.map((_, index) =>
+      baseStopsPerRider + (index < extraStops ? 1 : 0)
+    );
+    const assignedOrders: PendingOrderModel[][] = selectedRiders.map(() => []);
 
-    const routes = riders.slice(0, riderCount).map((rider, riderIndex) => {
-      const stops: PendingOrderModel[] = [];
-      const ridersLeft = riderCount - riderIndex;
-      const targetStops = Math.min(
-        3,
-        Math.ceil(remainingOrders.length / ridersLeft)
-      );
-      let currentPoint = 0;
-      let totalDistanceMeters = 0;
-      let totalDurationSeconds = 0;
+    // วางออเดอร์ที่มีระยะทาง x กล่องสูงก่อน แล้วเลือกกลุ่มที่เพิ่มค่าส่งน้อยที่สุด
+    const ordersByDistance = [...orders].sort((a, b) => {
+      const aDistance = distances[0]?.[pointIndexes.get(a.id)!] ?? -1;
+      const bDistance = distances[0]?.[pointIndexes.get(b.id)!] ?? -1;
+      return bDistance * Number(b.quantity) - aDistance * Number(a.quantity) || a.id - b.id;
+    });
 
-      while (stops.length < targetStops && remainingOrders.length > 0) {
-        let nearestIndex = -1;
-        let shortestDistance = Infinity;
-        let nearestDuration = 0;
+    for (const order of ordersByDistance) {
+      let bestRiderIndex = -1;
+      let bestPath: RoutePathResult | null = null;
+      let smallestAddedCostScore = Infinity;
 
-        for (let i = 0; i < remainingOrders.length; i++) {
-          const candidate = remainingOrders[i]!;
-          const distance = distances[currentPoint]?.[candidate.pointIndex];
-          const duration = durations[currentPoint]?.[candidate.pointIndex];
+      for (let riderIndex = 0; riderIndex < selectedRiders.length; riderIndex++) {
+        if (assignedOrders[riderIndex]!.length >= targetStops[riderIndex]!) continue;
 
-          if (
-            distance !== null &&
-            distance !== undefined &&
-            duration !== null &&
-            duration !== undefined &&
-            distance < shortestDistance
-          ) {
-            shortestDistance = distance;
-            nearestDuration = duration;
-            nearestIndex = i;
-          }
+        const currentPath = getBestRoutePath(
+          assignedOrders[riderIndex]!, pointIndexes, distances, durations
+        );
+        const candidatePath = getBestRoutePath(
+          [...assignedOrders[riderIndex]!, order], pointIndexes, distances, durations
+        );
+        if (!currentPath || !candidatePath) continue;
+
+        const addedCostScore = getBoxDistanceScore(candidatePath) - getBoxDistanceScore(currentPath);
+        if (
+          addedCostScore < smallestAddedCostScore ||
+          (addedCostScore === smallestAddedCostScore && candidatePath.durationSeconds < (bestPath?.durationSeconds ?? Infinity))
+        ) {
+          bestRiderIndex = riderIndex;
+          bestPath = candidatePath;
+          smallestAddedCostScore = addedCostScore;
         }
-
-        if (nearestIndex === -1) break;
-
-        const next = remainingOrders.splice(nearestIndex, 1)[0];
-        if (!next) break;
-
-        stops.push(next.order);
-        totalDistanceMeters += shortestDistance;
-        totalDurationSeconds += nearestDuration;
-        currentPoint = next.pointIndex;
       }
 
-      const totalBoxes = stops.reduce(
-        (sum, stop) => sum + Number(stop.quantity),
-        0
-      );
-      const travelMinutes = Math.ceil(totalDurationSeconds / 60);
+      if (bestRiderIndex < 0 || !bestPath) {
+        return res.status(400).json({
+          error: `หาเส้นทางถนนสำหรับออเดอร์ ${order.id} ไม่ได้`,
+          unassigned_order_ids: [order.id]
+        });
+      }
+      assignedOrders[bestRiderIndex] = bestPath.orders;
+    }
 
+    // สลับออเดอร์ข้ามไรเดอร์เพื่อหาการแบ่งกลุ่มที่ลดค่าส่งรวม โดยระยะทางเป็นตัวตัดสินรอง
+    let routePaths = assignedOrders.map((group) =>
+      getBestRoutePath(group, pointIndexes, distances, durations)
+    );
+    let improved = true;
+    let optimizationRounds = 0;
+
+    while (improved && optimizationRounds < 100) {
+      improved = false;
+      optimizationRounds++;
+      let bestSwap: {
+        firstRoute: number;
+        secondRoute: number;
+        firstOrder: number;
+        secondOrder: number;
+        firstPath: RoutePathResult;
+        secondPath: RoutePathResult;
+        improvement: number;
+        distanceImprovement: number;
+      } | null = null;
+
+      for (let firstRoute = 0; firstRoute < assignedOrders.length; firstRoute++) {
+        for (let secondRoute = firstRoute + 1; secondRoute < assignedOrders.length; secondRoute++) {
+          for (let firstOrder = 0; firstOrder < assignedOrders[firstRoute]!.length; firstOrder++) {
+            for (let secondOrder = 0; secondOrder < assignedOrders[secondRoute]!.length; secondOrder++) {
+              const firstGroup = [...assignedOrders[firstRoute]!];
+              const secondGroup = [...assignedOrders[secondRoute]!];
+              [firstGroup[firstOrder], secondGroup[secondOrder]] =
+                [secondGroup[secondOrder]!, firstGroup[firstOrder]!];
+
+              const firstPath = getBestRoutePath(firstGroup, pointIndexes, distances, durations);
+              const secondPath = getBestRoutePath(secondGroup, pointIndexes, distances, durations);
+              if (!firstPath || !secondPath) continue;
+
+              const oldFirstPath = routePaths[firstRoute]!;
+              const oldSecondPath = routePaths[secondRoute]!;
+              const improvement = getBoxDistanceScore(oldFirstPath) + getBoxDistanceScore(oldSecondPath)
+                - getBoxDistanceScore(firstPath) - getBoxDistanceScore(secondPath);
+              const distanceImprovement = oldFirstPath.distanceMeters + oldSecondPath.distanceMeters
+                - firstPath.distanceMeters - secondPath.distanceMeters;
+              if (
+                improvement > 0 &&
+                (!bestSwap || improvement > bestSwap.improvement ||
+                  (improvement === bestSwap.improvement && distanceImprovement > bestSwap.distanceImprovement))
+              ) {
+                bestSwap = {
+                  firstRoute,
+                  secondRoute,
+                  firstOrder,
+                  secondOrder,
+                  firstPath,
+                  secondPath,
+                  improvement,
+                  distanceImprovement
+                };
+              }
+            }
+          }
+        }
+      }
+
+      if (bestSwap) {
+        assignedOrders[bestSwap.firstRoute] = bestSwap.firstPath.orders;
+        assignedOrders[bestSwap.secondRoute] = bestSwap.secondPath.orders;
+        routePaths[bestSwap.firstRoute] = bestSwap.firstPath;
+        routePaths[bestSwap.secondRoute] = bestSwap.secondPath;
+        improved = true;
+      }
+    }
+
+    const routes = selectedRiders.map((rider, riderIndex) => {
+      const path = routePaths[riderIndex];
+      if (!path) throw new Error(`หาเส้นทางของไรเดอร์ ${rider.id} ไม่ได้`);
+
+      const totalBoxes = path.orders.reduce((sum, order) => sum + Number(order.quantity), 0);
       return {
         rider,
         total_boxes: totalBoxes,
-        stops: stops.map((stop, index) => ({
+        stops: path.orders.map((stop, index) => ({
           ...stop,
           stop_sequence: index + 1
         })),
-        distance_km: Number((totalDistanceMeters / 1000).toFixed(2)),
-        travel_minutes: travelMinutes,
+        distance_km: Number((path.distanceMeters / 1000).toFixed(2)),
+        travel_minutes: Math.ceil(path.durationSeconds / 60)
       };
     });
-
-    if (remainingOrders.length > 0) {
-      return res.status(400).json({
-        error: 'หาเส้นทางไปยังออเดอร์บางรายการไม่ได้',
-        unassigned_order_ids: remainingOrders.map((item) => item.order.id)
-      });
-    }
 
     const routesWithGeometry = await Promise.all(
       routes.map(async (route) => {
@@ -353,6 +487,14 @@ export const calculatePlan = async (req: Request, res: Response) => {
     try {
       await connection.beginTransaction();
 
+      // การคำนวณซ้ำแทนแผนที่ใช้งานอยู่ของวันเดียวกัน แต่เก็บแผนเก่าไว้
+      await connection.query(
+        `UPDATE delivery_plans
+         SET is_active = FALSE
+         WHERE delivery_date = ? AND is_active = TRUE`,
+        [deliveryDate]
+      );
+
       const [planResult] = await connection.query<ResultSetHeader>(
         `INSERT INTO delivery_plans
          (delivery_date, departure_time, deadline_time, rider_count, total_orders,
@@ -361,7 +503,7 @@ export const calculatePlan = async (req: Request, res: Response) => {
          VALUES (?, '11:30:00', '12:30:00', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           deliveryDate,
-          riderCount,
+          activeRiderCount,
           orders.length,
           totalBoxes,
           totalDistanceKm.toFixed(2),
@@ -471,7 +613,7 @@ export const calculatePlan = async (req: Request, res: Response) => {
     return res.json({
       plan_id: planId,
       delivery_date: deliveryDate,
-      rider_count: riderCount,
+      rider_count: activeRiderCount,
       total_orders: orders.length,
       total_boxes: totalBoxes,
       distance_km: Number(totalDistanceKm.toFixed(2)),

@@ -19,7 +19,7 @@ export const getJobs = async (req: Request, res: Response) => {
       FROM rider_routes rr
       JOIN delivery_plans p ON p.id = rr.plan_id
       JOIN riders r ON r.id = rr.rider_id
-      WHERE 1=1`;
+      WHERE p.is_active = TRUE`;
     const params: unknown[] = [];
     if (search) {
       sql += ` AND (rr.job_code LIKE ? OR r.name LIKE ? OR r.phone LIKE ?)`;
@@ -51,7 +51,7 @@ export const getJobByCode = async (req: Request, res: Response) => {
        FROM rider_routes rr
        JOIN delivery_plans p ON p.id = rr.plan_id
        JOIN riders r ON r.id = rr.rider_id
-       WHERE rr.job_code = ?`,
+       WHERE rr.job_code = ? AND p.is_active = TRUE`,
       [code]
     );
     const list = rows as RowDataPacket[];

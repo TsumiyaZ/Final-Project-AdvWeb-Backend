@@ -85,8 +85,12 @@ CREATE TABLE delivery_plans (
     profit DECIMAL(12, 2) NOT NULL,
     last_arrival_time TIME NOT NULL,
     all_on_time BOOLEAN NOT NULL,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    active_delivery_date DATE
+        GENERATED ALWAYS AS (CASE WHEN is_active THEN delivery_date ELSE NULL END) STORED,
     created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     PRIMARY KEY (id),
+    UNIQUE KEY uq_active_delivery_plan_date (active_delivery_date),
     INDEX idx_plans_date_created (delivery_date, created_at),
     CONSTRAINT chk_plan_time CHECK (deadline_time > departure_time),
     CONSTRAINT chk_plan_rider_count CHECK (rider_count > 0),
