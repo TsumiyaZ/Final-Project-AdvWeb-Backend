@@ -19,3 +19,14 @@ export interface UpdateOrderModel {
     order_date?: string;
     status?: string;
 }
+
+export interface PendingOrderModel {
+  id: number;
+  customer_id: number;
+  quantity: number;
+  customer_name: string;
+  phone?: string;
+  address?: string;
+  latitude: string | number;
+  longitude: string | number;
+}
