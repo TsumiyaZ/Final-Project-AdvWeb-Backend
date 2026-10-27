@@ -1,5 +1,9 @@
 import express from "express";
-import { getJobByCode, getJobs, markStopDelivered } from "../controllers/jobController";
+import {
+  getJobByCode,
+  getJobs,
+  markStopDelivered,
+} from "../controllers/jobController";
 
 export const router = express.Router();
 

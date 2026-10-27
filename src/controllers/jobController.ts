@@ -9,7 +9,6 @@ interface JobRecord extends RowDataPacket {
   stops?: RowDataPacket[];
 }
 
-
 // GET /api/jobs?search=
 export const getJobs = async (req: Request, res: Response) => {
   try {
@@ -59,7 +58,7 @@ export const getJobByCode = async (req: Request, res: Response) => {
        JOIN delivery_plans p ON p.id = rr.plan_id
        JOIN riders r ON r.id = rr.rider_id
        WHERE rr.job_code = ? AND p.is_active = TRUE`,
-      [code]
+      [code],
     );
     const job = rows[0];
     if (!job) return res.status(404).json({ error: "Job not found" });
@@ -72,7 +71,7 @@ export const getJobByCode = async (req: Request, res: Response) => {
        JOIN orders o ON o.id = rs.order_id
        WHERE rs.route_id = ?
        ORDER BY rs.stop_sequence`,
-      [job.route_id]
+      [job.route_id],
     );
     job.stops = stops;
 
@@ -99,6 +98,7 @@ export const markStopDelivered = async (req: Request, res: Response) => {
     return res.status(400).json({ error: "Invalid job code or order ID" });
   }
 
+  const orderId = Number(orderIdText);
   let connection: PoolConnection | undefined;
 
   try {
@@ -115,18 +115,22 @@ export const markStopDelivered = async (req: Request, res: Response) => {
          AND p.is_active = TRUE
          AND o.id = ?
        FOR UPDATE`,
-      [jobCode, Number(orderIdText)]
+      [jobCode, orderId],
     );
 
     const order = rows[0];
     if (!order) {
       await connection.rollback();
-      return res.status(404).json({ error: "Order was not found in this active job" });
+      return res
+        .status(404)
+        .json({ error: "Order was not found in this active job" });
     }
 
     if (order.status === "cancelled") {
       await connection.rollback();
-      return res.status(409).json({ error: "Cancelled orders cannot be marked as delivered" });
+      return res
+        .status(409)
+        .json({ error: "Cancelled orders cannot be marked as delivered" });
     }
 
     if (order.status === "delivered") {
@@ -134,31 +138,33 @@ export const markStopDelivered = async (req: Request, res: Response) => {
       return res.json({
         message: "Order was already delivered",
         order_id: Number(order.id),
-        status: "delivered"
+        status: "delivered",
       });
     }
 
-    const [result] = await connection.query<ResultSetHeader>(
+    const [updateResult] = await connection.query<ResultSetHeader>(
       "UPDATE orders SET status = 'delivered' WHERE id = ? AND status = 'pending'",
-      [Number(order.id)]
+      [orderId],
     );
 
-    if (result.affectedRows !== 1) {
+    if (updateResult.affectedRows !== 1) {
       await connection.rollback();
-      return res.status(409).json({ error: "Order status changed. Reload the job and try again" });
+      return res
+        .status(409)
+        .json({ error: "Order status changed. Reload the job and try again" });
     }
 
     await connection.commit();
     return res.json({
       message: "Order marked as delivered",
       order_id: Number(order.id),
-      status: "delivered"
+      status: "delivered",
     });
   } catch (err: unknown) {
     if (connection) await connection.rollback();
     console.error("markStopDelivered:", err);
     return res.status(500).json({ error: "Database error" });
   } finally {
-    connection?.release();
+    if (connection) connection.release();
   }
 };
